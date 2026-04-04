@@ -359,6 +359,40 @@ def integrate_incident_radiance(
     }
 
 
+def integrate_incident_radiance_importance(
+    albedo: torch.Tensor,
+    roughness: torch.Tensor,
+    metallic: torch.Tensor,
+    normals: torch.Tensor,
+    viewdirs: torch.Tensor,
+    lightdirs: torch.Tensor,
+    incident_radiance: torch.Tensor,
+    light_pdf: torch.Tensor,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    brdf, brdf_aux = evaluate_microfacet_brdf(
+        albedo=albedo,
+        roughness=roughness,
+        metallic=metallic,
+        normals=normals,
+        viewdirs=viewdirs,
+        lightdirs=lightdirs,
+        eps=eps,
+    )
+    safe_pdf = torch.clamp(torch.nan_to_num(light_pdf, nan=0.0, posinf=0.0, neginf=0.0), min=eps)
+    transport = incident_radiance * brdf_aux["n_dot_l"] / safe_pdf
+    diffuse = (brdf_aux["diffuse"] * transport).mean(dim=1)
+    specular = (brdf_aux["specular"] * transport).mean(dim=1)
+    shaded = diffuse + specular
+    return shaded, {
+        "diffuse": diffuse,
+        "specular": specular,
+        "n_dot_l": brdf_aux["n_dot_l"],
+        "brdf": brdf,
+        "light_pdf": safe_pdf,
+    }
+
+
 def shade_secondary_points(
     envmap: LatLongEnvMap,
     albedo: torch.Tensor,

@@ -170,18 +170,25 @@ def _merge_triangle_meshes(meshes) -> "o3d.geometry.TriangleMesh":
 
 
 @torch.no_grad()
-def _extract_mesh_with_probes(
+def _extract_largest_mesh(
     scene: Scene,
     gaussians: GaussianModel,
     pipe,
     dataset,
     output_root: Path,
-    probe_points: np.ndarray,
-    offset_distance: float,
     args,
-) -> Dict[str, object]:
+) -> Tuple[Optional["o3d.geometry.TriangleMesh"], Dict[str, object]]:
     if o3d is None:
-        return {"enabled": False, "reason": "open3d_unavailable"}
+        return None, {"enabled": False, "reason": "open3d_unavailable"}
+
+    all_cameras = _choose_cameras(scene, args.camera_set)
+    if len(all_cameras) == 0:
+        return None, {"enabled": False, "reason": f"no_cameras_for_{args.camera_set}"}
+    selected_cameras = all_cameras[:: max(1, args.view_stride)]
+    if args.max_views > 0:
+        selected_cameras = selected_cameras[: args.max_views]
+    if len(selected_cameras) == 0:
+        return None, {"enabled": False, "reason": "empty_mesh_camera_selection"}
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     extractor = GaussianExtractor(gaussians, render, pipe, bg_color=bg_color)
@@ -189,7 +196,7 @@ def _extract_mesh_with_probes(
 
     try:
         extractor.gaussians.active_sh_degree = 0
-        extractor.reconstruction(scene.getTrainCameras())
+        extractor.reconstruction(selected_cameras)
         depth_trunc = (extractor.radius * 2.0) if args.mesh_depth_trunc < 0 else args.mesh_depth_trunc
         voxel_size = (depth_trunc / args.mesh_res) if args.mesh_voxel_size < 0 else args.mesh_voxel_size
         sdf_trunc = (5.0 * voxel_size) if args.mesh_sdf_trunc < 0 else args.mesh_sdf_trunc
@@ -204,19 +211,53 @@ def _extract_mesh_with_probes(
 
     raw_mesh_path = output_root / "mesh_fuse_colored.ply"
     largest_mesh_path = output_root / "mesh_fuse_colored_largest.ply"
-    mesh_with_probes_path = output_root / "mesh_largest_with_probes.ply"
     o3d.io.write_triangle_mesh(str(raw_mesh_path), mesh)
 
     mesh_largest = post_process_mesh(mesh, cluster_to_keep=max(1, int(args.mesh_num_cluster)))
+    if len(mesh_largest.triangles) > 0:
+        mesh_largest.compute_triangle_normals()
+        mesh_largest.compute_vertex_normals()
     o3d.io.write_triangle_mesh(str(largest_mesh_path), mesh_largest)
 
+    return mesh_largest, {
+        "enabled": True,
+        "raw_mesh_path": str(raw_mesh_path),
+        "largest_mesh_path": str(largest_mesh_path),
+        "depth_trunc": float(depth_trunc),
+        "voxel_size": float(voxel_size),
+        "sdf_trunc": float(sdf_trunc),
+        "mesh_num_cluster": int(args.mesh_num_cluster),
+        "mesh_num_cameras": int(len(selected_cameras)),
+        "raw_mesh_vertices": int(len(mesh.vertices)),
+        "largest_mesh_vertices": int(len(mesh_largest.vertices)),
+        "largest_mesh_triangles": int(len(mesh_largest.triangles)),
+    }
+
+
+def _export_mesh_with_probes(
+    mesh_largest,
+    output_root: Path,
+    probe_points: np.ndarray,
+    offset_distance: float,
+    args,
+) -> Dict[str, object]:
+    if o3d is None or mesh_largest is None:
+        return {}
+
+    mesh_with_probes_path = output_root / "mesh_largest_with_probes.ply"
     if args.mesh_max_probe_spheres > 0 and probe_points.shape[0] > args.mesh_max_probe_spheres:
         probe_indices = np.linspace(0, probe_points.shape[0] - 1, args.mesh_max_probe_spheres, dtype=np.int64)
         probe_points_mesh = probe_points[probe_indices]
     else:
         probe_points_mesh = probe_points
 
-    probe_radius = args.mesh_probe_radius if args.mesh_probe_radius > 0 else max(offset_distance * 0.12, voxel_size * 1.5)
+    mesh_vertices = np.asarray(mesh_largest.vertices, dtype=np.float32)
+    if mesh_vertices.shape[0] > 0:
+        _, _, largest_side = _bbox_extent(mesh_vertices)
+    else:
+        largest_side = offset_distance
+
+    probe_radius = args.mesh_probe_radius if args.mesh_probe_radius > 0 else max(offset_distance * 0.12, largest_side * 0.003)
     probe_meshes = [mesh_largest]
     for point in probe_points_mesh:
         sphere = o3d.geometry.TriangleMesh.create_sphere(radius=probe_radius, resolution=max(4, int(args.mesh_probe_resolution)))
@@ -228,19 +269,298 @@ def _extract_mesh_with_probes(
     o3d.io.write_triangle_mesh(str(mesh_with_probes_path), mesh_with_probes)
 
     return {
-        "enabled": True,
-        "raw_mesh_path": str(raw_mesh_path),
-        "largest_mesh_path": str(largest_mesh_path),
         "mesh_with_probes_path": str(mesh_with_probes_path),
-        "depth_trunc": float(depth_trunc),
-        "voxel_size": float(voxel_size),
-        "sdf_trunc": float(sdf_trunc),
-        "mesh_num_cluster": int(args.mesh_num_cluster),
         "probe_radius": float(probe_radius),
         "probe_spheres": int(probe_points_mesh.shape[0]),
-        "raw_mesh_vertices": int(len(mesh.vertices)),
-        "largest_mesh_vertices": int(len(mesh_largest.vertices)),
     }
+
+
+def _sample_points_from_mesh(
+    mesh,
+    num_samples: int,
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if o3d is None or mesh is None:
+        raise RuntimeError("open3d mesh sampling requested but open3d is unavailable")
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive")
+
+    vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    triangles = np.asarray(mesh.triangles, dtype=np.int64)
+    if vertices.shape[0] == 0 or triangles.shape[0] == 0:
+        raise RuntimeError("mesh_largest is empty and cannot be sampled")
+
+    mesh.compute_triangle_normals()
+    mesh.compute_vertex_normals()
+    vertex_normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
+    if vertex_normals.shape[0] != vertices.shape[0]:
+        raise RuntimeError("mesh_largest vertex normals are unavailable")
+
+    tri_vertices = vertices[triangles]
+    edge_01 = tri_vertices[:, 1] - tri_vertices[:, 0]
+    edge_02 = tri_vertices[:, 2] - tri_vertices[:, 0]
+    tri_area2 = np.linalg.norm(np.cross(edge_01, edge_02), axis=1)
+    valid = tri_area2 > 1e-12
+    if not np.any(valid):
+        raise RuntimeError("mesh_largest has no valid triangles for sampling")
+
+    tri_vertices = tri_vertices[valid]
+    tri_indices = triangles[valid]
+    tri_weights = tri_area2[valid].astype(np.float64)
+    tri_weights /= np.clip(np.sum(tri_weights), 1e-12, None)
+
+    chosen = rng.choice(tri_vertices.shape[0], size=num_samples, replace=True, p=tri_weights)
+    sampled_tris = tri_vertices[chosen]
+    sampled_idx = tri_indices[chosen]
+
+    u = rng.random(num_samples).astype(np.float32)
+    v = rng.random(num_samples).astype(np.float32)
+    sqrt_u = np.sqrt(u)
+    bary = np.stack(
+        [
+            1.0 - sqrt_u,
+            sqrt_u * (1.0 - v),
+            sqrt_u * v,
+        ],
+        axis=1,
+    ).astype(np.float32)
+
+    sampled_points = np.sum(sampled_tris * bary[:, :, None], axis=1)
+    sampled_normals = np.sum(vertex_normals[sampled_idx] * bary[:, :, None], axis=1)
+    sampled_normals = _normalize_np(sampled_normals.astype(np.float32))
+
+    mesh_center = vertices.mean(axis=0, keepdims=True)
+    outward_hint = sampled_points - mesh_center
+    flip = np.sum(sampled_normals * outward_hint, axis=1) < 0.0
+    sampled_normals[flip] *= -1.0
+    return sampled_points.astype(np.float32), sampled_normals.astype(np.float32)
+
+
+def _sample_probe_surface_from_mesh(
+    mesh,
+    target_num_probes: int,
+    dense_sample_count: int,
+    device: torch.device,
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    dense_points, dense_normals = _sample_points_from_mesh(mesh, dense_sample_count, rng)
+    probe_surface_indices = _farthest_point_sampling(dense_points, target_num_probes, device)
+    probe_surface_points = dense_points[probe_surface_indices]
+    probe_surface_normals = _normalize_np(dense_normals[probe_surface_indices])
+    return dense_points, dense_normals, probe_surface_points, probe_surface_normals, probe_surface_indices
+
+
+def _build_mesh_raycast_scene(mesh):
+    if o3d is None or mesh is None or len(mesh.triangles) == 0:
+        return None
+
+    try:
+        mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+        scene = o3d.t.geometry.RaycastingScene()
+        scene.add_triangles(mesh_t)
+        return scene
+    except Exception:
+        return None
+
+
+def _query_mesh_signed_distance(
+    raycast_scene,
+    query_points: np.ndarray,
+    nsamples: int,
+) -> np.ndarray:
+    if raycast_scene is None:
+        raise RuntimeError("Raycasting scene is unavailable for mesh signed-distance queries")
+    if query_points.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    nsamples = max(1, int(nsamples))
+    if nsamples % 2 == 0:
+        nsamples += 1
+
+    query_tensor = o3d.core.Tensor(query_points.astype(np.float32))
+    signed_distance = raycast_scene.compute_signed_distance(query_tensor, nsamples=nsamples)
+    return np.asarray(signed_distance.numpy(), dtype=np.float32).reshape(-1)
+
+
+def _binary_search_probe_outside(
+    raycast_scene,
+    surface_points: np.ndarray,
+    directions: np.ndarray,
+    offset_distance: float,
+    inside_scales: np.ndarray,
+    outside_scales: np.ndarray,
+    nsamples: int,
+    search_steps: int,
+    outside_tol: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    inside_scales = inside_scales.astype(np.float32).copy()
+    outside_scales = outside_scales.astype(np.float32).copy()
+
+    for _ in range(max(1, int(search_steps))):
+        mid_scales = 0.5 * (inside_scales + outside_scales)
+        mid_points = surface_points + directions * (mid_scales[:, None] * offset_distance)
+        mid_signed_distance = _query_mesh_signed_distance(raycast_scene, mid_points, nsamples=nsamples)
+        mid_outside = mid_signed_distance > outside_tol
+        outside_scales = np.where(mid_outside, mid_scales, outside_scales)
+        inside_scales = np.where(mid_outside, inside_scales, mid_scales)
+
+    refined_points = surface_points + directions * (outside_scales[:, None] * offset_distance)
+    refined_signed_distance = _query_mesh_signed_distance(raycast_scene, refined_points, nsamples=nsamples)
+    return outside_scales.astype(np.float32), refined_points.astype(np.float32), refined_signed_distance.astype(np.float32)
+
+
+def _refine_probe_points_outside_mesh(
+    probe_surface_points: np.ndarray,
+    probe_points: np.ndarray,
+    probe_normals: np.ndarray,
+    mesh_largest,
+    offset_distance: float,
+    args,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, object], np.ndarray, np.ndarray, np.ndarray]:
+    default_methods = np.full(probe_points.shape[0], "not_checked", dtype="<U24")
+    if o3d is None:
+        return (
+            probe_points,
+            probe_normals,
+            {"enabled": False, "reason": "open3d_unavailable"},
+            np.zeros((probe_points.shape[0],), dtype=np.float32),
+            np.zeros((probe_points.shape[0],), dtype=np.float32),
+            default_methods,
+        )
+
+    raycast_scene = _build_mesh_raycast_scene(mesh_largest)
+    if raycast_scene is None:
+        return (
+            probe_points,
+            probe_normals,
+            {"enabled": False, "reason": "raycasting_scene_unavailable"},
+            np.zeros((probe_points.shape[0],), dtype=np.float32),
+            np.zeros((probe_points.shape[0],), dtype=np.float32),
+            default_methods,
+        )
+
+    nsamples = max(1, int(args.mesh_outside_check_nsamples))
+    if nsamples % 2 == 0:
+        nsamples += 1
+    outside_tol = max(float(offset_distance) * 1e-4, 1e-6)
+    max_scale = max(float(args.mesh_outside_search_max_scale), 1.25)
+    search_steps = max(1, int(args.mesh_outside_search_steps))
+
+    corrected_points = probe_points.astype(np.float32).copy()
+    corrected_normals = probe_normals.astype(np.float32).copy()
+    correction_method = np.full(probe_points.shape[0], "unchanged", dtype="<U24")
+
+    initial_signed_distance = _query_mesh_signed_distance(raycast_scene, corrected_points, nsamples=nsamples)
+    initial_inside_mask = initial_signed_distance < -outside_tol
+
+    if not np.any(initial_inside_mask):
+        final_signed_distance = initial_signed_distance.copy()
+        stats = {
+            "enabled": True,
+            "nsamples": int(nsamples),
+            "outside_tol": float(outside_tol),
+            "search_steps": int(search_steps),
+            "search_max_scale": float(max_scale),
+            "num_checked": int(probe_points.shape[0]),
+            "initial_inside": 0,
+            "corrected_by_flip": 0,
+            "corrected_by_search": 0,
+            "remaining_inside": 0,
+            "initial_signed_distance": _summarize_array(initial_signed_distance),
+            "final_signed_distance": _summarize_array(final_signed_distance),
+        }
+        return corrected_points, corrected_normals, stats, initial_signed_distance, final_signed_distance, correction_method
+
+    inside_indices = np.flatnonzero(initial_inside_mask)
+    surface_inside = probe_surface_points[inside_indices]
+    normals_inside = probe_normals[inside_indices]
+
+    flip_points = surface_inside - normals_inside * offset_distance
+    flip_signed_distance = _query_mesh_signed_distance(raycast_scene, flip_points, nsamples=nsamples)
+    flip_outside = flip_signed_distance > outside_tol
+    if np.any(flip_outside):
+        chosen_indices = inside_indices[flip_outside]
+        corrected_points[chosen_indices] = flip_points[flip_outside]
+        corrected_normals[chosen_indices] = -normals_inside[flip_outside]
+        correction_method[chosen_indices] = "flip_normal"
+
+    unresolved_inside_indices = inside_indices[~flip_outside]
+    search_corrected = 0
+    if unresolved_inside_indices.size > 0:
+        unresolved_surface = probe_surface_points[unresolved_inside_indices]
+        unresolved_normals = probe_normals[unresolved_inside_indices]
+        scale_candidates = np.array([0.125, 0.25, 0.5, 0.75, 0.875, 1.125, 1.25, 1.5, 2.0, 3.0, 4.0], dtype=np.float32)
+        scale_candidates = scale_candidates[scale_candidates <= max_scale + 1e-6]
+        if scale_candidates.size == 0 or scale_candidates[-1] < max_scale:
+            scale_candidates = np.unique(np.concatenate([scale_candidates, np.array([max_scale], dtype=np.float32)]))
+        scale_candidates = scale_candidates[np.abs(scale_candidates - 1.0) > 1e-6]
+
+        best_found = np.zeros(unresolved_inside_indices.shape[0], dtype=bool)
+        best_scale = np.ones(unresolved_inside_indices.shape[0], dtype=np.float32)
+        best_signed_distance = np.full(unresolved_inside_indices.shape[0], -np.inf, dtype=np.float32)
+        best_direction_sign = np.ones(unresolved_inside_indices.shape[0], dtype=np.float32)
+        best_score = np.full(unresolved_inside_indices.shape[0], np.inf, dtype=np.float32)
+
+        for direction_sign in (1.0, -1.0):
+            directions = unresolved_normals * direction_sign
+            for scale in scale_candidates:
+                candidate_points = unresolved_surface + directions * (scale * offset_distance)
+                candidate_signed_distance = _query_mesh_signed_distance(raycast_scene, candidate_points, nsamples=nsamples)
+                candidate_outside = candidate_signed_distance > outside_tol
+                candidate_score = np.full(unresolved_inside_indices.shape[0], np.inf, dtype=np.float32)
+                candidate_score[candidate_outside] = np.abs(scale - 1.0)
+                better = candidate_outside & (
+                    (candidate_score < best_score - 1e-6)
+                    | (
+                        (np.abs(candidate_score - best_score) <= 1e-6)
+                        & (candidate_signed_distance > best_signed_distance)
+                    )
+                )
+                if np.any(better):
+                    best_found[better] = True
+                    best_scale[better] = np.float32(scale)
+                    best_signed_distance[better] = candidate_signed_distance[better]
+                    best_direction_sign[better] = np.float32(direction_sign)
+                    best_score[better] = candidate_score[better]
+
+        if np.any(best_found):
+            found_indices = unresolved_inside_indices[best_found]
+            found_surface = probe_surface_points[found_indices]
+            found_directions = probe_normals[found_indices] * best_direction_sign[best_found][:, None]
+            found_scales = best_scale[best_found]
+            _, refined_points, refined_signed_distance = _binary_search_probe_outside(
+                raycast_scene=raycast_scene,
+                surface_points=found_surface,
+                directions=found_directions,
+                offset_distance=offset_distance,
+                inside_scales=np.ones(found_indices.shape[0], dtype=np.float32),
+                outside_scales=found_scales,
+                nsamples=nsamples,
+                search_steps=search_steps,
+                outside_tol=outside_tol,
+            )
+            corrected_points[found_indices] = refined_points
+            corrected_normals[found_indices] = found_directions
+            correction_method[found_indices] = "line_search"
+            search_corrected = int(found_indices.shape[0])
+
+    final_signed_distance = _query_mesh_signed_distance(raycast_scene, corrected_points, nsamples=nsamples)
+    remaining_inside = int(np.sum(final_signed_distance < -outside_tol))
+    stats = {
+        "enabled": True,
+        "nsamples": int(nsamples),
+        "outside_tol": float(outside_tol),
+        "search_steps": int(search_steps),
+        "search_max_scale": float(max_scale),
+        "num_checked": int(probe_points.shape[0]),
+        "initial_inside": int(np.sum(initial_inside_mask)),
+        "corrected_by_flip": int(np.sum(correction_method == "flip_normal")),
+        "corrected_by_search": int(search_corrected),
+        "remaining_inside": remaining_inside,
+        "initial_signed_distance": _summarize_array(initial_signed_distance),
+        "final_signed_distance": _summarize_array(final_signed_distance),
+    }
+    return corrected_points, corrected_normals, stats, initial_signed_distance, final_signed_distance, correction_method
 
 
 def _voxel_downsample_numpy(points: np.ndarray, normals: np.ndarray, voxel_size: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -939,21 +1259,8 @@ def initialize_sop_phase1(args) -> Dict[str, object]:
         args=args,
     )
 
-    object_extent = _compute_object_extent(surface_points, args.extent_mode)
-    offset_distance = args.offset_scale * object_extent
-    if offset_distance <= 0.0:
-        raise RuntimeError("Computed offset_distance <= 0. Check the fused surface cloud extent.")
-
-    target_num_probes = min(int(args.target_num_probes), int(surface_points.shape[0]))
-    if target_num_probes <= 0:
-        raise RuntimeError("No surface points available for probe sampling.")
-
     device = torch.device("cuda")
-    probe_surface_indices = _farthest_point_sampling(surface_points, target_num_probes, device)
-    probe_surface_points = surface_points[probe_surface_indices]
-    probe_normals = _normalize_np(surface_normals[probe_surface_indices])
-    probe_points = probe_surface_points + probe_normals * offset_distance
-
+    rng = np.random.default_rng(args.seed)
     gaussian_points = _to_numpy(gaussians.get_xyz).astype(np.float32)
     gaussian_colors = _to_numpy(gaussians.get_albedo).astype(np.float32)
     _, surface_color_idx = _chunked_nearest_neighbors(
@@ -968,13 +1275,129 @@ def initialize_sop_phase1(args) -> Dict[str, object]:
         device=device,
     )
     preclean_colors = gaussian_colors[preclean_color_idx]
-    nearest_surface_distance, nearest_surface_idx = _chunked_nearest_neighbors(
-        queries=probe_points,
-        references=surface_points,
+
+    requested_num_probes = int(args.target_num_probes)
+    if requested_num_probes <= 0:
+        raise RuntimeError("target_num_probes must be positive.")
+
+    need_mesh = args.probe_source == "mesh_largest" or not args.skip_mesh_export
+    mesh_largest = None
+    mesh_stats = {"enabled": False, "reason": "skip_mesh_export", "used_for_probe_sampling": False}
+    if need_mesh:
+        mesh_largest, mesh_stats = _extract_largest_mesh(
+            scene=scene,
+            gaussians=gaussians,
+            pipe=pipe,
+            dataset=dataset,
+            output_root=output_root,
+            args=args,
+        )
+        mesh_stats["used_for_probe_sampling"] = bool(args.probe_source == "mesh_largest")
+        if args.probe_source == "mesh_largest" and (mesh_largest is None or not mesh_stats.get("enabled", False)):
+            raise RuntimeError(f"probe_source=mesh_largest requires successful mesh extraction, got: {mesh_stats.get('reason', 'unknown_error')}")
+
+    if args.probe_source == "surface_fusion":
+        target_num_probes = min(requested_num_probes, int(surface_points.shape[0]))
+        if target_num_probes <= 0:
+            raise RuntimeError("No fused surface points available for probe sampling.")
+        probe_reference_points = surface_points
+        probe_reference_normals = surface_normals
+        probe_surface_indices = _farthest_point_sampling(probe_reference_points, target_num_probes, device)
+        probe_surface_points = probe_reference_points[probe_surface_indices]
+        probe_normals = _normalize_np(probe_reference_normals[probe_surface_indices])
+        object_extent = _compute_object_extent(probe_reference_points, args.extent_mode)
+        probe_source_stats = {
+            "probe_source": "surface_fusion",
+            "reference_points": int(probe_reference_points.shape[0]),
+            "target_num_probes_requested": requested_num_probes,
+            "target_num_probes_used": int(target_num_probes),
+        }
+        probe_reference_colors = surface_colors
+        probe_reference_title = "Fused object surface + SOP probes"
+    elif args.probe_source == "mesh_largest":
+        dense_sample_count = int(args.mesh_surface_sample_count)
+        if dense_sample_count <= 0:
+            dense_sample_count = max(requested_num_probes * 5, requested_num_probes)
+        dense_sample_count = max(dense_sample_count, requested_num_probes)
+        (
+            probe_reference_points,
+            probe_reference_normals,
+            probe_surface_points,
+            probe_normals,
+            probe_surface_indices,
+        ) = _sample_probe_surface_from_mesh(
+            mesh=mesh_largest,
+            target_num_probes=requested_num_probes,
+            dense_sample_count=dense_sample_count,
+            device=device,
+            rng=rng,
+        )
+        target_num_probes = int(probe_surface_points.shape[0])
+        mesh_vertices = np.asarray(mesh_largest.vertices, dtype=np.float32)
+        object_extent = _compute_object_extent(mesh_vertices if mesh_vertices.shape[0] > 0 else probe_reference_points, args.extent_mode)
+        _, probe_reference_color_idx = _chunked_nearest_neighbors(
+            queries=probe_reference_points,
+            references=gaussian_points,
+            device=device,
+        )
+        probe_reference_colors = gaussian_colors[probe_reference_color_idx]
+        probe_source_stats = {
+            "probe_source": "mesh_largest",
+            "reference_points": int(probe_reference_points.shape[0]),
+            "target_num_probes_requested": requested_num_probes,
+            "target_num_probes_used": int(target_num_probes),
+            "mesh_surface_sample_count": int(dense_sample_count),
+        }
+        probe_reference_title = "mesh_largest surface + SOP probes"
+    else:
+        raise ValueError(f"Unknown probe_source: {args.probe_source}")
+
+    offset_distance = args.offset_scale * object_extent
+    if offset_distance <= 0.0:
+        raise RuntimeError("Computed offset_distance <= 0. Check the selected probe source extent.")
+
+    probe_points = probe_surface_points + probe_normals * offset_distance
+    raw_probe_points = probe_points.copy()
+    raw_probe_normals = probe_normals.copy()
+    mesh_outside_check_stats = {"enabled": False, "reason": "probe_source_not_mesh_largest"}
+    mesh_signed_distance_before = np.zeros((probe_points.shape[0],), dtype=np.float32)
+    mesh_signed_distance_after = np.zeros((probe_points.shape[0],), dtype=np.float32)
+    mesh_correction_method = np.full(probe_points.shape[0], "not_checked", dtype="<U24")
+    if args.probe_source == "mesh_largest":
+        if args.disable_mesh_outside_check:
+            mesh_outside_check_stats = {"enabled": False, "reason": "disabled_by_flag"}
+        elif mesh_largest is None:
+            mesh_outside_check_stats = {"enabled": False, "reason": "mesh_largest_unavailable"}
+        else:
+            (
+                probe_points,
+                probe_normals,
+                mesh_outside_check_stats,
+                mesh_signed_distance_before,
+                mesh_signed_distance_after,
+                mesh_correction_method,
+            ) = _refine_probe_points_outside_mesh(
+                probe_surface_points=probe_surface_points,
+                probe_points=probe_points,
+                probe_normals=probe_normals,
+                mesh_largest=mesh_largest,
+                offset_distance=offset_distance,
+                args=args,
+            )
+
+    _, probe_surface_color_idx = _chunked_nearest_neighbors(
+        queries=probe_surface_points,
+        references=gaussian_points,
         device=device,
     )
-    nearest_surface_points = surface_points[nearest_surface_idx]
-    nearest_surface_normals = surface_normals[nearest_surface_idx]
+    probe_surface_colors = gaussian_colors[probe_surface_color_idx]
+    nearest_surface_distance, nearest_surface_idx = _chunked_nearest_neighbors(
+        queries=probe_points,
+        references=probe_reference_points,
+        device=device,
+    )
+    nearest_surface_points = probe_reference_points[nearest_surface_idx]
+    nearest_surface_normals = probe_reference_normals[nearest_surface_idx]
     signed_surface_offset = np.sum((probe_points - nearest_surface_points) * nearest_surface_normals, axis=1)
     normal_alignment = np.sum(probe_normals * nearest_surface_normals, axis=1)
     nearest_gaussian_distance, _ = _chunked_nearest_neighbors(
@@ -992,14 +1415,19 @@ def initialize_sop_phase1(args) -> Dict[str, object]:
         backface_alignment_thresh=args.backface_alignment_thresh,
     )
 
-    probe_surface_colors = surface_colors[probe_surface_indices]
     probe_offset_colors = np.clip(0.55 * probe_surface_colors + 0.45 * np.array([[1.0, 0.20, 0.20]], dtype=np.float32), 0.0, 1.0)
 
-    rng = np.random.default_rng(args.seed)
     _save_point_cloud(output_root / "surface_fused_voxel.ply", preclean_points, preclean_normals, colors=preclean_colors)
     _save_point_cloud(output_root / "surface_fused_clean.ply", surface_points, surface_normals, colors=surface_colors)
     _save_point_cloud(output_root / "object_points_weight_mask_voxel.ply", preclean_points, preclean_normals, colors=preclean_colors)
     _save_point_cloud(output_root / "object_points_weight_mask_clean.ply", surface_points, surface_normals, colors=surface_colors)
+    if args.probe_source == "mesh_largest":
+        _save_point_cloud(
+            output_root / "mesh_largest_surface_samples.ply",
+            probe_reference_points,
+            probe_reference_normals,
+            colors=probe_reference_colors,
+        )
     _save_point_cloud(
         output_root / "probe_surface_samples.ply",
         probe_surface_points,
@@ -1012,6 +1440,13 @@ def initialize_sop_phase1(args) -> Dict[str, object]:
         probe_normals,
         colors=probe_offset_colors,
     )
+    if mesh_outside_check_stats.get("enabled", False) and mesh_outside_check_stats.get("initial_inside", 0) > 0:
+        _save_point_cloud(
+            output_root / "probe_offset_points_before_mesh_outside_check.ply",
+            raw_probe_points,
+            raw_probe_normals,
+            colors=probe_offset_colors,
+        )
 
     gaussian_vis_idx = _pick_indices(gaussian_points.shape[0], args.max_gaussians_vis, rng)
     gaussian_vis = gaussian_points[gaussian_vis_idx]
@@ -1040,6 +1475,19 @@ def initialize_sop_phase1(args) -> Dict[str, object]:
     )
     _save_point_cloud(output_root / "object_points_plus_probes.ply", object_combined_points, object_combined_normals, object_combined_colors)
 
+    probe_ref_vis_idx = _pick_indices(probe_reference_points.shape[0], args.max_gaussians_vis, rng)
+    probe_ref_vis = probe_reference_points[probe_ref_vis_idx]
+    probe_ref_combined_points = np.concatenate([probe_ref_vis, probe_points], axis=0)
+    probe_ref_combined_normals = np.concatenate([probe_reference_normals[probe_ref_vis_idx], probe_normals], axis=0)
+    probe_ref_combined_colors = np.concatenate(
+        [
+            probe_reference_colors[probe_ref_vis_idx],
+            np.tile(np.array([[0.85, 0.28, 0.25]], dtype=np.float32), (probe_points.shape[0], 1)),
+        ],
+        axis=0,
+    )
+    _save_point_cloud(output_root / "probe_reference_plus_probes.ply", probe_ref_combined_points, probe_ref_combined_normals, probe_ref_combined_colors)
+
     normal_vis_idx = _pick_indices(probe_points.shape[0], args.max_probe_normals_vis, rng)
     _save_lineset(
         output_root / "probe_normals_lineset.ply",
@@ -1048,21 +1496,19 @@ def initialize_sop_phase1(args) -> Dict[str, object]:
         color=(0.12, 0.47, 0.71),
     )
 
-    mesh_stats = {"enabled": False, "reason": "skip_mesh_export"}
-    if not args.skip_mesh_export:
-        mesh_stats = _extract_mesh_with_probes(
-            scene=scene,
-            gaussians=gaussians,
-            pipe=pipe,
-            dataset=dataset,
-            output_root=output_root,
-            probe_points=probe_points,
-            offset_distance=offset_distance,
-            args=args,
+    if mesh_largest is not None and mesh_stats.get("enabled", False):
+        mesh_stats.update(
+            _export_mesh_with_probes(
+                mesh_largest=mesh_largest,
+                output_root=output_root,
+                probe_points=probe_points,
+                offset_distance=offset_distance,
+                args=args,
+            )
         )
 
     _plot_object_and_probes(gaussian_points, probe_points, debug_root / "object_gaussians_probes.png", rng, args.max_gaussians_vis)
-    _plot_context_and_probes(surface_points, probe_points, debug_root / "object_points_probes.png", rng, args.max_gaussians_vis, "Object-only points + SOP probes", context_color="#666666", context_alpha=0.35)
+    _plot_context_and_probes(probe_reference_points, probe_points, debug_root / "object_points_probes.png", rng, args.max_gaussians_vis, probe_reference_title, context_color="#666666", context_alpha=0.35)
     _plot_probe_normals(probe_points, probe_normals, offset_distance, debug_root / "probe_normals.png", rng, args.max_probe_normals_vis)
     _plot_distance_histogram(nearest_surface_distance, offset_distance, debug_root / "probe_surface_distance_hist.png")
     _plot_probe_quality(probe_points, statuses, status_counts, debug_root / "probe_quality_status.png")
@@ -1082,6 +1528,8 @@ def initialize_sop_phase1(args) -> Dict[str, object]:
         output_root / "probe_init_data.npz",
         surface_points=surface_points.astype(np.float32),
         surface_normals=surface_normals.astype(np.float32),
+        probe_reference_points=probe_reference_points.astype(np.float32),
+        probe_reference_normals=probe_reference_normals.astype(np.float32),
         probe_surface_points=probe_surface_points.astype(np.float32),
         probe_points=probe_points.astype(np.float32),
         probe_normals=probe_normals.astype(np.float32),
@@ -1091,10 +1539,15 @@ def initialize_sop_phase1(args) -> Dict[str, object]:
         preclean_colors=preclean_colors.astype(np.float32),
         probe_surface_colors=probe_surface_colors.astype(np.float32),
         probe_offset_colors=probe_offset_colors.astype(np.float32),
+        probe_points_before_mesh_outside_check=raw_probe_points.astype(np.float32),
+        probe_normals_before_mesh_outside_check=raw_probe_normals.astype(np.float32),
         nearest_surface_distance=nearest_surface_distance.astype(np.float32),
         nearest_gaussian_distance=nearest_gaussian_distance.astype(np.float32),
+        mesh_signed_distance_before=mesh_signed_distance_before.astype(np.float32),
+        mesh_signed_distance_after=mesh_signed_distance_after.astype(np.float32),
         signed_surface_offset=signed_surface_offset.astype(np.float32),
         normal_alignment=normal_alignment.astype(np.float32),
+        mesh_correction_method=mesh_correction_method,
         status=statuses,
     )
 
@@ -1107,8 +1560,11 @@ def initialize_sop_phase1(args) -> Dict[str, object]:
         "output_root": str(output_root),
         "camera_set": args.camera_set,
         "object_filter_mode": args.object_filter_mode,
+        "probe_source": args.probe_source,
+        "probe_source_stats": probe_source_stats,
         "num_surface_points_voxel": int(preclean_points.shape[0]),
         "num_surface_points_clean": int(surface_points.shape[0]),
+        "num_probe_reference_points": int(probe_reference_points.shape[0]),
         "num_probes": int(probe_points.shape[0]),
         "extent_mode": args.extent_mode,
         "object_extent": float(object_extent),
@@ -1123,13 +1579,22 @@ def initialize_sop_phase1(args) -> Dict[str, object]:
         "status_counts": status_counts,
         "fusion": fusion_stats,
         "mesh": mesh_stats,
+        "mesh_outside_check": mesh_outside_check_stats,
         "args": dict(vars(args)),
     }
     with open(output_root / "probe_quality_summary.json", "w") as summary_file:
         json.dump(quality_summary, summary_file, indent=2, default=_to_serializable)
 
     print(f"[SOP-Phase1] Fused clean surface points: {surface_points.shape[0]}")
-    print(f"[SOP-Phase1] Probes: {probe_points.shape[0]}, offset distance: {offset_distance:.6f}")
+    print(f"[SOP-Phase1] Probe source: {args.probe_source}, probes: {probe_points.shape[0]}, offset distance: {offset_distance:.6f}")
+    if mesh_outside_check_stats.get("enabled", False):
+        print(
+            "[SOP-Phase1] Mesh outside check: "
+            f"initial_inside={mesh_outside_check_stats.get('initial_inside', 0)}, "
+            f"flip={mesh_outside_check_stats.get('corrected_by_flip', 0)}, "
+            f"search={mesh_outside_check_stats.get('corrected_by_search', 0)}, "
+            f"remaining_inside={mesh_outside_check_stats.get('remaining_inside', 0)}"
+        )
     print(f"[SOP-Phase1] Status counts: {status_counts}")
     print(f"[SOP-Phase1] Outputs written to {output_root}")
 
@@ -1167,7 +1632,13 @@ def _build_parser() -> ArgumentParser:
     parser.add_argument("--weight_thresh", default=0.1, type=float)
     parser.add_argument("--mask_thresh", default=0.5, type=float)
     parser.add_argument("--mask_erosion_radius", default=4, type=int)
+    parser.add_argument("--probe_source", choices=["surface_fusion", "mesh_largest"], default="surface_fusion")
     parser.add_argument("--target_num_probes", default=5000, type=int)
+    parser.add_argument("--mesh_surface_sample_count", default=0, type=int)
+    parser.add_argument("--disable_mesh_outside_check", action="store_true")
+    parser.add_argument("--mesh_outside_check_nsamples", default=11, type=int)
+    parser.add_argument("--mesh_outside_search_steps", default=10, type=int)
+    parser.add_argument("--mesh_outside_search_max_scale", default=4.0, type=float)
     parser.add_argument("--offset_scale", default=0.01, type=float)
     parser.add_argument("--extent_mode", choices=["bbox_diagonal", "max_side"], default="bbox_diagonal")
     parser.add_argument("--too_close_factor", default=0.5, type=float)
