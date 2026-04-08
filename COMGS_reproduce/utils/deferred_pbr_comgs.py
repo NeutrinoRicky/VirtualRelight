@@ -1,15 +1,29 @@
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from utils.sop_utils import build_octahedral_direction_grid, dir_to_oct_uv, oct_uv_to_dir, sample_octahedral_texture
+
+
+DEFAULT_OCT_ENV_HEIGHT = 256
+DEFAULT_OCT_ENV_WIDTH = 256
 
 
 def depths_to_points(view, depthmap: torch.Tensor) -> torch.Tensor:
     """
     Convert a depth map [1, H, W] to world-space points [H, W, 3].
     """
+    rays_d_hw = getattr(view, "rays_d_hw_unnormalized", None)
+    camera_center = getattr(view, "camera_center", None)
+    if rays_d_hw is not None and camera_center is not None:
+        rays_d_hw = rays_d_hw.to(device=depthmap.device, dtype=depthmap.dtype)
+        camera_center = camera_center.to(device=depthmap.device, dtype=depthmap.dtype)
+        points = depthmap.permute(1, 2, 0) * rays_d_hw + camera_center
+        return torch.nan_to_num(points, nan=0.0, posinf=0.0, neginf=0.0)
+
     c2w = (view.world_view_transform.T).inverse()
     width, height = view.image_width, view.image_height
     device = depthmap.device
@@ -59,6 +73,30 @@ def recover_shading_points(
 
 def compute_view_directions(points: torch.Tensor, camera_center: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return F.normalize(camera_center.view(1, 3) - points, dim=-1, eps=eps)
+
+
+def rgb_to_srgb(x: torch.Tensor, clip: bool = True) -> torch.Tensor:
+    y = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    threshold = torch.tensor(0.0031308, device=y.device, dtype=y.dtype)
+    y = torch.where(
+        y > threshold,
+        torch.pow(torch.max(y, threshold), 1.0 / 2.4) * 1.055 - 0.055,
+        12.92 * y,
+    )
+    if clip:
+        y = torch.clamp(y, 0.0, 1.0)
+    return y
+
+
+def _rgb_to_srgb_for_vis(x: torch.Tensor, clip: bool = True) -> torch.Tensor:
+    return rgb_to_srgb(x.detach(), clip=clip)
+
+
+def _tonemap_hdr_for_vis(x: torch.Tensor) -> torch.Tensor:
+    y = torch.nan_to_num(x.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+    y = torch.clamp(y, min=0.0)
+    y = y / (1.0 + y)
+    return _rgb_to_srgb_for_vis(y, clip=True)
 
 
 def _radical_inverse_vdc(bits: torch.Tensor) -> torch.Tensor:
@@ -143,6 +181,66 @@ def sample_hemisphere_hammersley(
     )
     solid_angle = nrm.new_tensor(2.0 * math.pi / float(max(num_samples, 1)))
     return world_dirs, pdf, solid_angle
+
+
+def _rotation_between_z(vec: torch.Tensor) -> torch.Tensor:
+    v1 = -vec[..., 1]
+    v2 = vec[..., 0]
+    v3 = torch.zeros_like(v1)
+    v11 = v1 * v1
+    v22 = v2 * v2
+    v33 = v3 * v3
+    v12 = v1 * v2
+    v13 = v1 * v3
+    v23 = v2 * v3
+    cos_p_1 = (vec[..., 2] + 1.0).clamp_min(1e-7)
+    rot = torch.zeros(vec.shape[:-1] + (3, 3), dtype=vec.dtype, device=vec.device)
+    rot[..., 0, 0] = 1.0 + (-v33 - v22) / cos_p_1
+    rot[..., 0, 1] = -v3 + v12 / cos_p_1
+    rot[..., 0, 2] = v2 + v13 / cos_p_1
+    rot[..., 1, 0] = v3 + v12 / cos_p_1
+    rot[..., 1, 1] = 1.0 + (-v33 - v11) / cos_p_1
+    rot[..., 1, 2] = -v1 + v23 / cos_p_1
+    rot[..., 2, 0] = -v2 + v13 / cos_p_1
+    rot[..., 2, 1] = v1 + v23 / cos_p_1
+    rot[..., 2, 2] = 1.0 + (-v22 - v11) / cos_p_1
+    neg_eye = -torch.eye(3, dtype=vec.dtype, device=vec.device).expand_as(rot)
+    return torch.where((vec[..., 2] + 1.0 > 0.0)[..., None, None], rot, neg_eye)
+
+
+def sample_incident_rays_irgs(
+    normals: torch.Tensor,
+    training: bool = False,
+    sample_num: int = 24,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    pre_shape = normals.shape[:-1]
+    flat_normals = normals.reshape(-1, 3) if len(pre_shape) > 1 else normals
+    flat_normals = F.normalize(flat_normals, dim=-1, eps=1e-6)
+
+    delta = math.pi * (3.0 - math.sqrt(5.0))
+    idx = torch.arange(sample_num, dtype=flat_normals.dtype, device=flat_normals.device)[None]
+    denom = float(max(2 * sample_num - 1, 1))
+    min_z = math.sin(math.radians(10.0))
+    z = (1.0 - 2.0 * idx / denom).clamp_min(min_z)
+    rad = torch.sqrt(torch.clamp(1.0 - z * z, min=0.0))
+    theta = delta * idx
+    if training:
+        theta = torch.rand((flat_normals.shape[0], 1), device=flat_normals.device, dtype=flat_normals.dtype) * (2.0 * math.pi) + theta
+    else:
+        theta = theta.expand(flat_normals.shape[0], -1)
+    y = torch.cos(theta) * rad
+    x = torch.sin(theta) * rad
+    z_samples = torch.stack([x, y, z.expand_as(y)], dim=-2)
+
+    rotation = _rotation_between_z(flat_normals)
+    incident_dirs = rotation @ z_samples
+    incident_dirs = F.normalize(incident_dirs, dim=-2, eps=1e-6).transpose(-1, -2)
+    incident_areas = torch.ones_like(incident_dirs[..., 0:1]) * (2.0 * math.pi)
+
+    if len(pre_shape) > 1:
+        incident_dirs = incident_dirs.reshape(*pre_shape, sample_num, 3)
+        incident_areas = incident_areas.reshape(*pre_shape, sample_num, 1)
+    return incident_dirs, incident_areas
 
 
 class LatLongEnvMap(nn.Module):
@@ -273,13 +371,219 @@ class LatLongEnvMap(nn.Module):
         return envmap
 
     def visualization(self) -> torch.Tensor:
-        env = self.activated_map().detach()
-        env = env / env.max().clamp_min(1e-6)
+        env = _tonemap_hdr_for_vis(self.activated_map())
         return env.permute(2, 0, 1)
+
+
+class OctahedralEnvMap(nn.Module):
+    def __init__(
+        self,
+        height: int = 32,
+        width: Optional[int] = None,
+        init_value: float = 0.5,
+        activation: str = "exp",
+    ):
+        super().__init__()
+        self.height = int(height)
+        self.width = int(width) if width is not None else int(height)
+        self.activation_name = activation
+
+        base = torch.full((self.height, self.width, 3), float(init_value), dtype=torch.float32)
+        if activation == "exp":
+            self.base = nn.Parameter(torch.log(torch.clamp(base, min=1e-4)))
+            self._activation = torch.exp
+        elif activation == "softplus":
+            self.base = nn.Parameter(torch.log(torch.exp(base) - 1.0 + 1e-6))
+            self._activation = F.softplus
+        elif activation == "none":
+            self.base = nn.Parameter(base)
+            self._activation = lambda x: x
+        else:
+            raise ValueError(f"Unsupported envmap activation: {activation}")
+
+        self.register_buffer("_pdf", torch.empty(0), persistent=False)
+        self.update_pdf()
+
+    def activated_map(self) -> torch.Tensor:
+        return torch.clamp(self._activation(self.base), min=0.0)
+
+    def update_pdf(self):
+        with torch.no_grad():
+            env = self.activated_map().detach()
+            luminance = env.max(dim=-1).values.clamp_min(1e-8)
+            pdf = luminance / luminance.sum().clamp_min(1e-8)
+            self._pdf = pdf
+
+    def sample_light_directions(self, batch_size: int, sample_num: int, training: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._pdf.numel() == 0 or self._pdf.shape[0] != self.height or self._pdf.shape[1] != self.width:
+            self.update_pdf()
+
+        pdf_flat = self._pdf.reshape(-1)
+        idx = torch.multinomial(pdf_flat, batch_size * sample_num, replacement=True)
+        x = (idx % self.width).to(dtype=self.base.dtype)
+        y = (idx // self.width).to(dtype=self.base.dtype)
+
+        u = (x + 0.5) / float(self.width)
+        v = (y + 0.5) / float(self.height)
+        if training:
+            u = torch.clamp(u + (torch.rand_like(u) - 0.5) / float(self.width), 1e-6, 1.0 - 1e-6)
+            v = torch.clamp(v + (torch.rand_like(v) - 0.5) / float(self.height), 1e-6, 1.0 - 1e-6)
+
+        uv = torch.stack([u, v], dim=-1)
+        directions = oct_uv_to_dir(uv).reshape(batch_size, sample_num, 3)
+        probability = self.light_pdf(directions)
+        return directions, probability
+
+    def light_pdf(self, directions: torch.Tensor) -> torch.Tensor:
+        if self._pdf.numel() == 0 or self._pdf.shape[0] != self.height or self._pdf.shape[1] != self.width:
+            self.update_pdf()
+
+        flat_dirs = directions.reshape(-1, 3)
+        uv = dir_to_oct_uv(flat_dirs)
+        x = torch.clamp((uv[:, 0] * self.width).long(), min=0, max=self.width - 1)
+        y = torch.clamp((uv[:, 1] * self.height).long(), min=0, max=self.height - 1)
+        flat_idx = y * self.width + x
+        pdf_flat = self._pdf.reshape(-1)
+        texel_pdf = torch.take_along_dim(pdf_flat, flat_idx, dim=0)
+        # Approximate each oct texel with equal solid angle to keep runtime sampling simple.
+        texel_solid_angle = (4.0 * math.pi) / float(max(self.height * self.width, 1))
+        direction_pdf = texel_pdf / max(texel_solid_angle, 1e-8)
+        return direction_pdf.reshape(*directions.shape[:-1], 1)
+
+    def forward(self, directions: torch.Tensor) -> torch.Tensor:
+        env = self.activated_map()
+        sampled = sample_octahedral_texture(env, directions)
+        return torch.clamp(sampled, min=0.0)
+
+    def capture(self) -> Dict[str, object]:
+        return {
+            "projection": "octahedral",
+            "state_dict": self.state_dict(),
+            "height": self.height,
+            "width": self.width,
+            "activation": self.activation_name,
+        }
+
+    @classmethod
+    def from_capture(cls, payload: Dict[str, object]) -> "OctahedralEnvMap":
+        envmap = cls(
+            height=payload["height"],
+            width=payload["width"],
+            activation=payload["activation"],
+        )
+        envmap.load_state_dict(payload["state_dict"])
+        envmap.update_pdf()
+        return envmap
+
+    @classmethod
+    def from_latlong_envmap(
+        cls,
+        latlong_envmap: LatLongEnvMap,
+        height: int,
+        width: Optional[int] = None,
+    ) -> "OctahedralEnvMap":
+        oct_width = int(width) if width is not None else int(height)
+        env = latlong_envmap.activated_map().detach()
+        device = env.device
+        dtype = env.dtype
+        oct_dirs = build_octahedral_direction_grid(
+            tex_h=int(height),
+            tex_w=oct_width,
+            device=device,
+            dtype=dtype,
+        )
+        oct_tex = latlong_envmap(oct_dirs).detach()
+        envmap = cls(height=int(height), width=oct_width, activation="none")
+        envmap = envmap.to(device=device, dtype=dtype)
+        with torch.no_grad():
+            envmap.base.copy_(oct_tex)
+        envmap.update_pdf()
+        return envmap
+
+    def visualization(self) -> torch.Tensor:
+        env = _tonemap_hdr_for_vis(self.activated_map())
+        return env.permute(2, 0, 1)
+
+
+def convert_envmap_to_octahedral(
+    envmap: Union[LatLongEnvMap, OctahedralEnvMap],
+    height: int = DEFAULT_OCT_ENV_HEIGHT,
+    width: int = DEFAULT_OCT_ENV_WIDTH,
+) -> OctahedralEnvMap:
+    target_h = int(height)
+    target_w = int(width)
+    if isinstance(envmap, OctahedralEnvMap) and envmap.height == target_h and envmap.width == target_w:
+        return envmap
+
+    if isinstance(envmap, LatLongEnvMap):
+        return OctahedralEnvMap.from_latlong_envmap(envmap, height=target_h, width=target_w)
+
+    device = envmap.base.device
+    dtype = envmap.base.dtype
+    oct_dirs = build_octahedral_direction_grid(
+        tex_h=target_h,
+        tex_w=target_w,
+        device=device,
+        dtype=dtype,
+    )
+    oct_tex = envmap(oct_dirs).detach()
+    oct_envmap = OctahedralEnvMap(height=target_h, width=target_w, activation="none").to(device=device, dtype=dtype)
+    with torch.no_grad():
+        oct_envmap.base.copy_(oct_tex)
+    oct_envmap.update_pdf()
+    return oct_envmap
+
+
+def load_envmap_capture_as_octahedral(
+    payload: Dict[str, object],
+    height: int = DEFAULT_OCT_ENV_HEIGHT,
+    width: int = DEFAULT_OCT_ENV_WIDTH,
+) -> OctahedralEnvMap:
+    projection = str(payload.get("projection", "latlong")).lower()
+    if projection == "octahedral":
+        envmap = OctahedralEnvMap.from_capture(payload)
+    else:
+        envmap = LatLongEnvMap.from_capture(payload)
+    return convert_envmap_to_octahedral(envmap, height=height, width=width)
 
 
 def fresnel_schlick(cos_theta: torch.Tensor, f0: torch.Tensor) -> torch.Tensor:
     return f0 + (1.0 - f0) * torch.pow(1.0 - cos_theta.clamp(0.0, 1.0), 5.0)
+
+
+def ggx_specular_irgs(
+    normals: torch.Tensor,
+    viewdirs: torch.Tensor,
+    lightdirs: torch.Tensor,
+    roughness: torch.Tensor,
+    fresnel: float = 0.04,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    light = F.normalize(lightdirs, dim=-1, eps=eps)
+    view = F.normalize(viewdirs, dim=-1, eps=eps)
+    half = F.normalize((light + view[:, None, :]) / 2.0, dim=-1, eps=eps)
+    normal = F.normalize(normals, dim=-1, eps=eps)
+
+    n_dot_v = torch.sum(view * normal, dim=-1, keepdim=True)
+    normal = normal * n_dot_v.sign()
+
+    n_dot_l = torch.sum(normal[:, None, :] * light, dim=-1, keepdim=True).clamp_(eps, 1.0)
+    n_dot_v = torch.sum(normal * view, dim=-1, keepdim=True).clamp_(eps, 1.0)
+    n_dot_h = torch.sum(normal[:, None, :] * half, dim=-1, keepdim=True).clamp_(eps, 1.0)
+    v_dot_h = torch.sum(view[:, None, :] * half, dim=-1, keepdim=True).clamp_(eps, 1.0)
+
+    alpha = roughness * roughness
+    alpha2 = alpha * alpha
+    k = (alpha + 2.0 * roughness + 1.0) / 8.0
+    fmi = ((-5.55473) * v_dot_h - 6.98316) * v_dot_h
+    frac0 = fresnel + (1.0 - fresnel) * torch.pow(2.0, fmi)
+
+    frac = frac0 * alpha2[:, None, :]
+    denom0 = n_dot_h * n_dot_h * (alpha2[:, None, :] - 1.0) + 1.0
+    denom1 = n_dot_v * (1.0 - k) + k
+    denom2 = n_dot_l * (1.0 - k[:, None, :]) + k[:, None, :]
+    denom = (4.0 * math.pi * denom0 * denom0 * denom1[:, None, :] * denom2).clamp_(eps, 4.0 * math.pi)
+    return frac / denom
 
 
 def evaluate_microfacet_brdf(
@@ -359,6 +663,40 @@ def integrate_incident_radiance(
     }
 
 
+def integrate_incident_radiance_irgs(
+    base_color: torch.Tensor,
+    roughness: torch.Tensor,
+    normals: torch.Tensor,
+    viewdirs: torch.Tensor,
+    lightdirs: torch.Tensor,
+    incident_radiance: torch.Tensor,
+    incident_areas: torch.Tensor,
+    fresnel: float = 0.04,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    lightdirs = F.normalize(lightdirs, dim=-1, eps=eps)
+    normals = F.normalize(normals, dim=-1, eps=eps)
+    n_dot_l = (normals[:, None, :] * lightdirs).sum(-1, keepdim=True).clamp(min=0.0)
+    diffuse_brdf = base_color[:, None, :] / math.pi
+    specular_brdf = ggx_specular_irgs(
+        normals=normals,
+        viewdirs=viewdirs,
+        lightdirs=lightdirs,
+        roughness=roughness,
+        fresnel=fresnel,
+        eps=eps,
+    )
+    transport = incident_radiance * incident_areas * n_dot_l
+    diffuse = (diffuse_brdf * transport).mean(dim=1)
+    specular = (specular_brdf * transport).mean(dim=1)
+    shaded = diffuse + specular
+    return shaded, {
+        "diffuse": diffuse,
+        "specular": specular,
+        "n_dot_l": n_dot_l,
+    }
+
+
 def integrate_incident_radiance_importance(
     albedo: torch.Tensor,
     roughness: torch.Tensor,
@@ -394,7 +732,7 @@ def integrate_incident_radiance_importance(
 
 
 def shade_secondary_points(
-    envmap: LatLongEnvMap,
+    envmap,
     albedo: torch.Tensor,
     roughness: torch.Tensor,
     metallic: torch.Tensor,

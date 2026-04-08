@@ -369,13 +369,12 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             image_name = Path(cam_name).stem
             image = Image.open(image_path)
 
-            im_data = np.array(image.convert("RGBA"))
-
-            bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
-
-            norm_data = im_data / 255.0
-            arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
+            im_data = np.array(image.convert("RGBA"), dtype=np.float32) / 255.0
+            alpha_mask = (im_data[:, :, 3:4] > 0.5).astype(np.float32)  # object mask from alpha
+            bg = np.array([1, 1, 1], dtype=np.float32) if white_background else np.array([0, 0, 0], dtype=np.float32)
+            rgb = im_data[:, :, :3] * alpha_mask + bg * (1.0 - alpha_mask)
+            rgba = np.concatenate([rgb, alpha_mask], axis=-1)
+            image = Image.fromarray(np.clip(rgba * 255.0, 0.0, 255.0).astype(np.uint8), "RGBA")
 
             fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
             FovY = fovy

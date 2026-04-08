@@ -106,6 +106,60 @@ def _build_export_masks(viewpoint_cam, render_pkg, valid_mask: torch.Tensor, exp
     }
 
 
+def _composite_on_white(x: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+    return torch.clamp(x * alpha + (1.0 - alpha), 0.0, 1.0)
+
+
+def _build_object_shading_mask(
+    viewpoint_cam,
+    render_pkg,
+    valid_mask: torch.Tensor,
+    object_mask_mode: str,
+    mask_threshold: float,
+):
+    render_alpha = torch.clamp(render_pkg["weight"].detach(), 0.0, 1.0)
+    gt_alpha = _get_gt_alpha_mask(viewpoint_cam, render_alpha)
+    render_object_mask = render_alpha[0] > float(mask_threshold)
+
+    if object_mask_mode == "auto":
+        if gt_alpha is not None:
+            object_mask = gt_alpha[0] > float(mask_threshold)
+            source = "gt_alpha_mask"
+        else:
+            object_mask = valid_mask.bool()
+            source = "valid_mask_fallback_no_gt"
+    elif object_mask_mode == "gt":
+        if gt_alpha is not None:
+            object_mask = gt_alpha[0] > float(mask_threshold)
+            source = "gt_alpha_mask"
+        else:
+            object_mask = valid_mask.bool()
+            source = "valid_mask_fallback_no_gt"
+    elif object_mask_mode == "render":
+        object_mask = render_object_mask
+        source = "render_alpha"
+    elif object_mask_mode == "intersect":
+        if gt_alpha is not None:
+            object_mask = render_object_mask & (gt_alpha[0] > float(mask_threshold))
+            source = "render_alpha_and_gt_alpha"
+        else:
+            object_mask = render_object_mask
+            source = "render_alpha_fallback_no_gt"
+    else:
+        raise ValueError(f"Unsupported object_mask_mode: {object_mask_mode}")
+
+    shading_mask = valid_mask.bool() & object_mask
+    if not torch.any(shading_mask):
+        shading_mask = valid_mask.bool()
+        source = f"{source}_fallback_valid_mask_empty"
+
+    return shading_mask, {
+        "object_mask": object_mask.unsqueeze(0).float(),
+        "object_shading_mask": shading_mask.unsqueeze(0).float(),
+        "object_mask_source": source,
+    }
+
+
 def _cuda_checkpoint_map_location():
     if not torch.cuda.is_available():
         return "cpu"
@@ -217,6 +271,8 @@ def render_stage2_sop_view(
     sop_query_radius: float,
     sop_query_topk: int,
     export_mask_mode: str,
+    object_mask_mode: str = "auto",
+    object_mask_threshold: float = 0.5,
     sampling_mode: str = "env_importance",
     profile_efficiency: bool = False,
     randomized_samples: bool = False,
@@ -259,6 +315,13 @@ def render_stage2_sop_view(
         weight=render_pkg["weight"],
         weight_threshold=weight_threshold,
     )
+    shading_mask, object_mask_info = _build_object_shading_mask(
+        viewpoint_cam=viewpoint_cam,
+        render_pkg=render_pkg,
+        valid_mask=valid_mask,
+        object_mask_mode=object_mask_mode,
+        mask_threshold=object_mask_threshold,
+    )
     if profile_efficiency:
         _sync_cuda()
         recover_t1 = time.perf_counter()
@@ -266,7 +329,7 @@ def render_stage2_sop_view(
         cache_build_t0 = time.perf_counter()
     view_neighbor_cache = build_view_sop_neighbor_cache(
         points=points,
-        valid_mask=valid_mask,
+        valid_mask=shading_mask,
         probe_xyz=sop_tensors["probe_xyz"],
         probe_normal=sop_tensors["probe_normal"],
         radius=float(sop_query_radius) if sop_query_radius and sop_query_radius > 0.0 else None,
@@ -404,7 +467,8 @@ def render_stage2_sop_view(
         timing["sop_query_other_sec"] = max(timing["sop_query_sec"] - sop_query_profiled_sum, 0.0)
 
     pbr_render_raw = pbr_flat.reshape(height, width, 3).permute(2, 0, 1)
-    masks = _build_export_masks(viewpoint_cam, render_pkg, valid_mask, export_mask_mode)
+    masks = _build_export_masks(viewpoint_cam, render_pkg, shading_mask, export_mask_mode)
+    masks.update(object_mask_info)
     pbr_render_masked = pbr_render_raw * masks["export_alpha"]
     timing["render_core_sec"] = timing["gbuffer_render_sec"] + timing["sop_query_shading_sec"]
 
@@ -414,7 +478,8 @@ def render_stage2_sop_view(
         "sop_direct": direct_flat.reshape(height, width, 3).permute(2, 0, 1),
         "sop_indirect": indirect_flat.reshape(height, width, 3).permute(2, 0, 1),
         "sop_occlusion": occlusion_flat.reshape(height, width, 1).permute(2, 0, 1),
-        "valid_mask": valid_mask.unsqueeze(0),
+        "valid_mask": shading_mask.unsqueeze(0),
+        "full_valid_mask": valid_mask.unsqueeze(0),
         "masks": masks,
         "render_pkg": render_pkg,
         "timing": timing,
@@ -433,23 +498,23 @@ def save_stage2_sop_outputs(output_dir: str, view_name: str, stage2_view_pkg: di
     depth_raw = render_pkg["depth_unbiased"].detach().cpu().numpy()
     np.save(os.path.join(output_dir, f"{view_name}_depth_unbiased.npy"), depth_raw)
 
-    rgb_raw = torch.clamp(stage2_view_pkg["pbr_render_raw"], 0.0, 1.0)
-    rgb_masked = torch.clamp(stage2_view_pkg["pbr_render"], 0.0, 1.0)
-    rgb_on_white = torch.clamp(rgb_masked + (1.0 - export_alpha), 0.0, 1.0)
+    rgb_raw = _composite_on_white(torch.clamp(stage2_view_pkg["pbr_render_raw"], 0.0, 1.0), export_alpha)
+    rgb_masked = _composite_on_white(torch.clamp(stage2_view_pkg["pbr_render"], 0.0, 1.0), export_alpha)
+    rgb_on_white = rgb_masked
 
-    albedo_raw = torch.clamp(render_pkg["albedo"], 0.0, 1.0)
-    roughness_raw = torch.clamp(render_pkg["roughness"], 0.0, 1.0)
-    metallic_raw = torch.clamp(render_pkg["metallic"], 0.0, 1.0)
-    normal_raw = torch.clamp(render_pkg["normal"] * 0.5 + 0.5, 0.0, 1.0)
+    albedo_raw = _composite_on_white(torch.clamp(render_pkg["albedo"], 0.0, 1.0), export_alpha)
+    roughness_raw = _composite_on_white(torch.clamp(render_pkg["roughness"], 0.0, 1.0), export_alpha)
+    metallic_raw = _composite_on_white(torch.clamp(render_pkg["metallic"], 0.0, 1.0), export_alpha)
+    normal_raw = _composite_on_white(torch.clamp(render_pkg["normal"] * 0.5 + 0.5, 0.0, 1.0), export_alpha)
 
-    albedo = albedo_raw * export_alpha
-    roughness = roughness_raw * export_alpha
-    metallic = metallic_raw * export_alpha
-    normal = normal_raw * export_alpha
-    depth_vis = _normalize_single_channel_for_vis(render_pkg["depth_unbiased"], valid_mask=valid)
-    sop_direct = _tonemap_for_vis(stage2_view_pkg["sop_direct"]) * export_alpha
-    sop_indirect = _tonemap_for_vis(stage2_view_pkg["sop_indirect"]) * export_alpha
-    sop_occlusion = torch.clamp(stage2_view_pkg["sop_occlusion"], 0.0, 1.0) * export_alpha
+    albedo = albedo_raw
+    roughness = roughness_raw
+    metallic = metallic_raw
+    normal = normal_raw
+    depth_vis = _composite_on_white(_normalize_single_channel_for_vis(render_pkg["depth_unbiased"], valid_mask=valid), export_alpha)
+    sop_direct = _composite_on_white(_tonemap_for_vis(stage2_view_pkg["sop_direct"]), export_alpha)
+    sop_indirect = _composite_on_white(_tonemap_for_vis(stage2_view_pkg["sop_indirect"]), export_alpha)
+    sop_occlusion = _composite_on_white(torch.clamp(stage2_view_pkg["sop_occlusion"], 0.0, 1.0), export_alpha)
 
     torchvision.utils.save_image(rgb_masked, os.path.join(output_dir, f"{view_name}_rgb.png"))
     torchvision.utils.save_image(rgb_raw, os.path.join(output_dir, f"{view_name}_rgb_raw.png"))
@@ -458,6 +523,8 @@ def save_stage2_sop_outputs(output_dir: str, view_name: str, stage2_view_pkg: di
 
     torchvision.utils.save_image(export_alpha, os.path.join(output_dir, f"{view_name}_alpha.png"))
     torchvision.utils.save_image(export_mask, os.path.join(output_dir, f"{view_name}_mask.png"))
+    torchvision.utils.save_image(masks["object_mask"], os.path.join(output_dir, f"{view_name}_object_mask.png"))
+    torchvision.utils.save_image(masks["object_shading_mask"], os.path.join(output_dir, f"{view_name}_object_shading_mask.png"))
     torchvision.utils.save_image(masks["render_alpha"], os.path.join(output_dir, f"{view_name}_render_alpha.png"))
     torchvision.utils.save_image(masks["render_mask"], os.path.join(output_dir, f"{view_name}_render_mask.png"))
     if masks["gt_alpha"] is not None:
@@ -548,7 +615,7 @@ def _finalize_efficiency_stats(stats):
 
 def _print_efficiency_summary(split_name: str, summary: dict):
     print(
-        f"[Stage2-SOP-IS][Efficiency][{split_name}] "
+        f"[Stage2-SOP-IS-OBJ][Efficiency][{split_name}] "
         f"views={summary['num_views']} "
         f"render={summary['render_core_sec']:.4f}s "
         f"(gbuffer={summary['gbuffer_render_sec']:.4f}s, "
@@ -568,7 +635,7 @@ def _print_efficiency_summary(split_name: str, summary: dict):
         f"save={summary['save_sec']:.4f}s other={summary['other_sec']:.4f}s total={summary['total_wall_sec']:.4f}s"
     )
     print(
-        f"[Stage2-SOP-IS][Efficiency][{split_name}] "
+        f"[Stage2-SOP-IS-OBJ][Efficiency][{split_name}] "
         f"avg_render={summary['avg_render_ms_per_view']:.3f}ms/view "
         f"(gbuffer={summary['avg_gbuffer_ms_per_view']:.3f}ms, "
         f"sop+pbr={summary['avg_sop_query_shading_ms_per_view']:.3f}ms, "
@@ -592,7 +659,7 @@ def _print_efficiency_summary(split_name: str, summary: dict):
 
 def _print_efficiency_per_view(split_name: str, view_name: str, render_timing: dict, total_wall_sec: float, save_sec: float, other_sec: float):
     msg = (
-        f"[Stage2-SOP-IS][Efficiency][{split_name}][{view_name}] "
+        f"[Stage2-SOP-IS-OBJ][Efficiency][{split_name}][{view_name}] "
         f"render={1000.0 * float(render_timing['render_core_sec']):.3f}ms "
         f"(gbuffer={1000.0 * float(render_timing['gbuffer_render_sec']):.3f}ms, "
         f"sop+pbr={1000.0 * float(render_timing['sop_query_shading_sec']):.3f}ms, "
@@ -627,7 +694,7 @@ def _build_unique_view_name(viewpoint_cam):
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Render images from a Stage2 SOP checkpoint with configurable light sampling")
+    parser = ArgumentParser(description="Render object-only images from a Stage2 SOP checkpoint with configurable light sampling")
     model = ModelParams(parser, sentinel=True)
     opt = OptimizationParams(parser)
     pipeline = PipelineParams(parser)
@@ -635,12 +702,14 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--split", type=str, default="train", choices=["train", "test", "both"])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--num_shading_samples", type=int, default=128)
+    parser.add_argument("--num_shading_samples", type=int, default=256)
     parser.add_argument("--query_chunk_size", type=int, default=2048)
     parser.add_argument("--sop_query_radius", type=float, default=0.0)
     parser.add_argument("--sop_query_topk", type=int, default=8)
     parser.add_argument("--disable_sample_jitter", action="store_true")
-    parser.add_argument("--export_mask_mode", type=str, default="render", choices=["render", "gt", "intersect"])
+    parser.add_argument("--export_mask_mode", type=str, default="gt", choices=["render", "gt", "intersect"])
+    parser.add_argument("--object_mask_mode", type=str, default="auto", choices=["auto", "gt", "render", "intersect"])
+    parser.add_argument("--object_mask_threshold", type=float, default=0.5)
     parser.add_argument("--sampling_mode", type=str, default="env_importance", choices=["uniform", "env_importance"])
     parser.add_argument("--profile_efficiency", action="store_true", default=False)
     parser.add_argument("--profile_efficiency_per_view", action="store_true", default=False)
@@ -648,9 +717,10 @@ if __name__ == "__main__":
 
     safe_state(args.quiet)
     checkpoint_path = args.checkpoint or os.path.join(args.model_path, "object_step2_sop.ckpt")
-    print("Rendering stage2 SOP importance-sampled views for " + args.model_path)
+    print("Rendering stage2 SOP importance-sampled object-only views for " + args.model_path)
     print("Loading checkpoint: " + checkpoint_path)
     print("Sampling mode:", args.sampling_mode)
+    print("Object mask mode:", args.object_mask_mode)
 
     dataset = model.extract(args)
     opt_args = opt.extract(args)
@@ -683,7 +753,7 @@ if __name__ == "__main__":
 
         output_dir = os.path.join(
             args.model_path,
-            "stage2_sop_importance_sample_render",
+            "stage2_sop_importance_sample_object_render",
             split_name,
             f"ours_{iteration}_{args.sampling_mode}",
         )
@@ -710,6 +780,8 @@ if __name__ == "__main__":
                 sop_query_radius=args.sop_query_radius,
                 sop_query_topk=args.sop_query_topk,
                 export_mask_mode=args.export_mask_mode,
+                object_mask_mode=args.object_mask_mode,
+                object_mask_threshold=args.object_mask_threshold,
                 sampling_mode=args.sampling_mode,
                 profile_efficiency=args.profile_efficiency,
                 randomized_samples=not args.disable_sample_jitter,

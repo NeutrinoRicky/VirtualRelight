@@ -16,9 +16,16 @@ from arguments import ModelParams, OptimizationParams, PipelineParams, get_combi
 from gaussian_renderer import render_multitarget
 from scene import Scene, GaussianModel
 from train_stage1_comgs import prepare_output_and_logger
-from utils.deferred_pbr_comgs import LatLongEnvMap
+from utils.deferred_pbr_comgs import (
+    DEFAULT_OCT_ENV_HEIGHT,
+    DEFAULT_OCT_ENV_WIDTH,
+    OctahedralEnvMap,
+    load_envmap_capture_as_octahedral,
+    recover_shading_points,
+)
 from utils.general_utils import safe_state
 from utils.losses_comgs_stage2_sop import compute_stage2_sop_loss
+from utils.sop_utils import build_view_sop_neighbor_cache
 from utils.tracing_comgs import TraceBackendConfig, build_trace_backend
 
 
@@ -166,44 +173,183 @@ def _cuda_checkpoint_map_location():
     return torch.device("cuda")
 
 
-def _load_gaussians_from_checkpoint(gaussians: GaussianModel, opt, checkpoint_path: str) -> Tuple[int, str]:
+def _clone_tensor(x):
+    if torch.is_tensor(x):
+        return x.detach().clone()
+    return x
+
+
+def _clone_trainable_parameter(x: torch.Tensor) -> nn.Parameter:
+    return nn.Parameter(x.detach().clone().requires_grad_(True))
+
+
+def _filled_trainable_parameter_like(x: torch.Tensor, value: float) -> nn.Parameter:
+    return _clone_trainable_parameter(torch.full_like(x, float(value)))
+
+
+def _encode_visible_material_like(gaussians: GaussianModel, template: torch.Tensor, value: float, material_name: str) -> nn.Parameter:
+    visible = torch.full_like(template, float(value))
+    if material_name == "albedo":
+        raw = gaussians._encode_visible_albedo(visible)
+    elif material_name == "roughness":
+        raw = gaussians._encode_visible_roughness(visible)
+    elif material_name == "metallic":
+        raw = gaussians._encode_visible_metallic(visible)
+    else:
+        raise ValueError(f"Unsupported material name: {material_name}")
+    return _clone_trainable_parameter(raw)
+
+
+def _describe_model_args(model_args) -> str:
+    if isinstance(model_args, (tuple, list)):
+        return f"{type(model_args).__name__}(len={len(model_args)})"
+    return type(model_args).__name__
+
+
+def _convert_irgs_refgs_model_args(model_args, fallback_optimizer_state, gaussians: GaussianModel):
+    # Discard RefGS material tensors and reinitialize stage2 materials.
+    # Keep albedo/roughness aligned with IRGS stage2 defaults, but restore
+    # metallic to the original COMGS visible-space zero init.
+    irgs_init_albedo = 0.3
+    irgs_init_roughness = 0.7
+    irgs_init_metallic = 0.0
+
+    if not isinstance(model_args, (tuple, list)) or len(model_args) != 19:
+        raise RuntimeError(
+            "IRGS refgs checkpoint should store model params as a tuple/list with len=19, "
+            f"but got {_describe_model_args(model_args)}."
+        )
+
+    (
+        active_sh_degree,
+        xyz,
+        metallic_raw,
+        roughness_raw,
+        base_color_raw,
+        features_dc,
+        features_rest,
+        _indirect_dc,
+        _indirect_rest,
+        scaling,
+        rotation,
+        opacity,
+        max_radii2D,
+        xyz_gradient_accum,
+        denom,
+        _opt_dict,
+        _env_map_1,
+        _env_map_2,
+        spatial_lr_scale,
+    ) = model_args
+
+    return (
+        int(active_sh_degree),
+        _clone_trainable_parameter(xyz),
+        _clone_trainable_parameter(features_dc),
+        _clone_trainable_parameter(features_rest),
+        _clone_trainable_parameter(scaling),
+        _clone_trainable_parameter(rotation),
+        _clone_trainable_parameter(opacity),
+        _encode_visible_material_like(gaussians, base_color_raw, irgs_init_albedo, "albedo"),
+        _encode_visible_material_like(gaussians, roughness_raw, irgs_init_roughness, "roughness"),
+        _encode_visible_material_like(gaussians, metallic_raw, irgs_init_metallic, "metallic"),
+        _clone_tensor(max_radii2D),
+        _clone_tensor(xyz_gradient_accum),
+        _clone_tensor(denom),
+        fallback_optimizer_state,
+        float(spatial_lr_scale),
+    )
+
+
+def _resolve_stage1_model_args(gaussians: GaussianModel, checkpoint_path: str, stage1_ckpt_format: str):
     payload = torch.load(checkpoint_path, map_location=_cuda_checkpoint_map_location())
     if isinstance(payload, dict) and "gaussians" in payload:
-        model_params = payload["gaussians"]
-        iteration = int(payload.get("iteration", 0))
-        label = payload.get("format", "checkpoint_dict")
-    elif isinstance(payload, (tuple, list)) and len(payload) >= 2:
-        model_params = payload[0]
-        iteration = int(payload[1])
-        label = "stage1_checkpoint"
-    else:
-        raise ValueError(f"Unsupported checkpoint format: {checkpoint_path}")
+        return payload["gaussians"], int(payload.get("iteration", 0)), payload.get("format", "checkpoint_dict")
 
+    if not isinstance(payload, (tuple, list)) or len(payload) < 1:
+        raise RuntimeError(f"Unsupported checkpoint payload type for {checkpoint_path}: {type(payload).__name__}")
+
+    model_args = payload[0]
+    iteration = int(payload[1]) if len(payload) >= 2 else 0
+
+    if stage1_ckpt_format == "comgs":
+        if not isinstance(model_args, (tuple, list)) or len(model_args) not in {12, 15}:
+            raise RuntimeError(
+                "Expected a COMGS checkpoint with model params len=12 or len=15, "
+                f"but got {_describe_model_args(model_args)} from {checkpoint_path}."
+            )
+        return model_args, iteration, "comgs_stage1"
+
+    if stage1_ckpt_format == "irgs_refgs":
+        return (
+            _convert_irgs_refgs_model_args(model_args, gaussians.optimizer.state_dict(), gaussians),
+            iteration,
+            "irgs_refgs_compat",
+        )
+
+    if isinstance(model_args, (tuple, list)) and len(model_args) in {12, 15}:
+        return model_args, iteration, "comgs_stage1"
+
+    if isinstance(model_args, (tuple, list)) and len(model_args) == 19:
+        return (
+            _convert_irgs_refgs_model_args(model_args, gaussians.optimizer.state_dict(), gaussians),
+            iteration,
+            "irgs_refgs_compat",
+        )
+
+    raise RuntimeError(
+        "Unable to auto-detect stage1 checkpoint format for "
+        f"{checkpoint_path}: got {_describe_model_args(model_args)}. "
+        "Try --stage1_ckpt_format comgs or --stage1_ckpt_format irgs_refgs."
+    )
+
+
+def _load_gaussians_from_checkpoint(
+    gaussians: GaussianModel,
+    opt,
+    checkpoint_path: str,
+    stage1_ckpt_format: str = "auto",
+) -> Tuple[int, str]:
+    model_params, iteration, label = _resolve_stage1_model_args(gaussians, checkpoint_path, stage1_ckpt_format)
     gaussians.restore(model_params, opt)
     return iteration, label
 
 
-def _load_envmap_from_args(args) -> Tuple[LatLongEnvMap, Dict[str, object]]:
+def _load_envmap_from_args(args) -> Tuple[OctahedralEnvMap, Dict[str, object]]:
     if args.stage2_trace_ckpt:
         payload = torch.load(args.stage2_trace_ckpt, map_location="cpu")
         if not isinstance(payload, dict) or payload.get("format") != "comgs_stage2_trace_v1" or "envmap" not in payload:
             raise RuntimeError(f"{args.stage2_trace_ckpt} is not a valid Stage2 Trace checkpoint with envmap")
-        envmap = LatLongEnvMap.from_capture(payload["envmap"]).cuda()
+        envmap = load_envmap_capture_as_octahedral(
+            payload["envmap"],
+            height=args.envmap_height,
+            width=args.envmap_width,
+        ).cuda()
         return envmap, {
             "source": "stage2_trace_ckpt",
             "path": args.stage2_trace_ckpt,
             "iteration": int(payload.get("iteration", -1)),
+            "projection": "octahedral",
+            "height": int(envmap.height),
+            "width": int(envmap.width),
         }
 
     if args.envmap_capture:
         capture = torch.load(args.envmap_capture, map_location="cpu")
-        envmap = LatLongEnvMap.from_capture(capture).cuda()
+        envmap = load_envmap_capture_as_octahedral(
+            capture,
+            height=args.envmap_height,
+            width=args.envmap_width,
+        ).cuda()
         return envmap, {
             "source": "envmap_capture",
             "path": args.envmap_capture,
+            "projection": "octahedral",
+            "height": int(envmap.height),
+            "width": int(envmap.width),
         }
 
-    envmap = LatLongEnvMap(
+    envmap = OctahedralEnvMap(
         height=args.envmap_height,
         width=args.envmap_width,
         init_value=args.envmap_init_value,
@@ -211,6 +357,7 @@ def _load_envmap_from_args(args) -> Tuple[LatLongEnvMap, Dict[str, object]]:
     ).cuda()
     return envmap, {
         "source": "default_constant",
+        "projection": "octahedral",
         "height": int(args.envmap_height),
         "width": int(args.envmap_width),
         "init_value": float(args.envmap_init_value),
@@ -225,6 +372,9 @@ def load_initial_stage2_sop_state(
     model_path: str,
     sop_init_path: str,
     start_checkpoint: Optional[str] = None,
+    stage1_ckpt_format: str = "auto",
+    envmap_height: int = DEFAULT_OCT_ENV_HEIGHT,
+    envmap_width: int = DEFAULT_OCT_ENV_WIDTH,
 ):
     if start_checkpoint:
         payload = torch.load(start_checkpoint, map_location=_cuda_checkpoint_map_location())
@@ -232,7 +382,11 @@ def load_initial_stage2_sop_state(
             raise RuntimeError(f"{start_checkpoint} is not a valid Stage2 SOP checkpoint")
 
         gaussians.restore(payload["gaussians"], opt)
-        envmap = LatLongEnvMap.from_capture(payload["envmap"]).cuda()
+        envmap = load_envmap_capture_as_octahedral(
+            payload["envmap"],
+            height=envmap_height,
+            width=envmap_width,
+        ).cuda()
         sop_state = Stage2SOPState(payload["sop"])
         info = {
             "loaded_from": {
@@ -258,7 +412,12 @@ def load_initial_stage2_sop_state(
             info,
         )
 
-    ckpt_iteration, ckpt_label = _load_gaussians_from_checkpoint(gaussians, opt, stage1_ckpt)
+    ckpt_iteration, ckpt_label = _load_gaussians_from_checkpoint(
+        gaussians,
+        opt,
+        stage1_ckpt,
+        stage1_ckpt_format=stage1_ckpt_format,
+    )
     sop_path = _resolve_sop_init_path(sop_init_path, model_path=model_path)
     sop_payload = _load_sop_payload(sop_path)
     sop_state = Stage2SOPState(sop_payload)
@@ -284,6 +443,7 @@ def save_stage2_sop_checkpoint(path, gaussians, envmap, env_optimizer, sop_state
         "format": "comgs_stage2_sop_v1",
         "iteration": int(iteration),
         "stage1_checkpoint": stage1_ckpt,
+        "stage1_checkpoint_format": getattr(args, "stage1_ckpt_format", "auto"),
         "sop_init_path": sop_init_path,
         "trace_backend": trace_backend_name,
         "args": dict(vars(args)),
@@ -296,7 +456,7 @@ def save_stage2_sop_checkpoint(path, gaussians, envmap, env_optimizer, sop_state
     torch.save(payload, path)
 
 
-def save_envmap_artifacts(envmap: LatLongEnvMap, output_root: str, stem: str):
+def save_envmap_artifacts(envmap, output_root: str, stem: str):
     os.makedirs(output_root, exist_ok=True)
     torchvision.utils.save_image(envmap.visualization(), os.path.join(output_root, f"{stem}.png"))
     torch.save(envmap.capture(), os.path.join(output_root, f"{stem}.pt"))
@@ -363,6 +523,23 @@ def _add_boolean_toggle(parser: ArgumentParser, name: str, default: bool, help_t
     parser.set_defaults(**{name: default})
 
 
+def _build_view_neighbor_cache_key(viewpoint_cam, sop_query_radius: float, sop_query_topk: int, weight_threshold: float):
+    uid = getattr(viewpoint_cam, "uid", None)
+    image_name = getattr(viewpoint_cam, "image_name", "view")
+    image_height = getattr(viewpoint_cam, "image_height", None)
+    image_width = getattr(viewpoint_cam, "image_width", None)
+    radius_key = float(sop_query_radius) if sop_query_radius and sop_query_radius > 0.0 else -1.0
+    return (
+        uid,
+        image_name,
+        image_height,
+        image_width,
+        radius_key,
+        int(sop_query_topk),
+        float(weight_threshold),
+    )
+
+
 def training_stage2_sop(dataset, opt, pipe, stage2_args):
     tb_writer = prepare_output_and_logger(stage2_args)
     dataset.model_path = stage2_args.model_path
@@ -378,6 +555,9 @@ def training_stage2_sop(dataset, opt, pipe, stage2_args):
         model_path=stage2_args.model_path,
         sop_init_path=stage2_args.sop_init,
         start_checkpoint=stage2_args.start_checkpoint,
+        stage1_ckpt_format=stage2_args.stage1_ckpt_format,
+        envmap_height=stage2_args.envmap_height,
+        envmap_width=stage2_args.envmap_width,
     )
     if not gaussians.get_xyz.is_cuda:
         raise RuntimeError("Loaded Gaussian parameters are not on CUDA. Please check checkpoint loading and current CUDA visibility.")
@@ -442,6 +622,9 @@ def training_stage2_sop(dataset, opt, pipe, stage2_args):
     canonical_ckpt_path = os.path.join(scene.model_path, "object_step2_sop.ckpt")
     summary_path = os.path.join(scene.model_path, "object_step2_sop_summary.json")
     resolved_sop_source_path = state_info.get("sop_source", {}).get("path", stage2_args.sop_init)
+    view_neighbor_cache_store = {} if stage2_args.freeze_geometry else None
+    if view_neighbor_cache_store is not None:
+        print("[Stage2-SOP] Per-view SOP neighbor cache enabled because geometry is frozen.")
 
     ema_total = 0.0
     ema_pbr = 0.0
@@ -466,6 +649,35 @@ def training_stage2_sop(dataset, opt, pipe, stage2_args):
 
         render_pkg = render_multitarget(viewpoint_cam, gaussians, pipe, background)
         gt_rgb = viewpoint_cam.original_image.cuda()
+        current_view_neighbor_cache = None
+        if view_neighbor_cache_store is not None:
+            weight_threshold = 1e-4
+            cache_key = _build_view_neighbor_cache_key(
+                viewpoint_cam=viewpoint_cam,
+                sop_query_radius=stage2_args.sop_query_radius,
+                sop_query_topk=stage2_args.sop_query_topk,
+                weight_threshold=weight_threshold,
+            )
+            current_view_neighbor_cache = view_neighbor_cache_store.get(cache_key)
+            if current_view_neighbor_cache is None:
+                with torch.no_grad():
+                    cached_points, cached_valid_mask = recover_shading_points(
+                        view=viewpoint_cam,
+                        depth_unbiased=render_pkg["depth_unbiased"],
+                        weight=render_pkg["weight"],
+                        weight_threshold=weight_threshold,
+                    )
+                    current_view_neighbor_cache = build_view_sop_neighbor_cache(
+                        points=cached_points,
+                        valid_mask=cached_valid_mask,
+                        probe_xyz=sop_state.probe_xyz,
+                        probe_normal=sop_state.probe_normal,
+                        radius=float(stage2_args.sop_query_radius) if stage2_args.sop_query_radius and stage2_args.sop_query_radius > 0.0 else None,
+                        topk=stage2_args.sop_query_topk,
+                        chunk_size=stage2_args.sop_query_chunk_size,
+                        storage_device=torch.device("cpu"),
+                    )
+                view_neighbor_cache_store[cache_key] = current_view_neighbor_cache
 
         total_loss, loss_stats, aux = compute_stage2_sop_loss(
             render_pkg=render_pkg,
@@ -492,6 +704,7 @@ def training_stage2_sop(dataset, opt, pipe, stage2_args):
             trace_bias=stage2_args.trace_bias,
             secondary_num_samples=stage2_args.secondary_num_samples,
             randomized_samples=not stage2_args.disable_sample_jitter,
+            view_neighbor_cache=current_view_neighbor_cache,
         )
 
         total_loss.backward()
@@ -639,6 +852,13 @@ def _build_parser() -> ArgumentParser:
     parser.set_defaults(iterations=2000, position_lr_max_steps=2000)
 
     parser.add_argument("--stage1_ckpt", type=str, required=True)
+    parser.add_argument(
+        "--stage1_ckpt_format",
+        type=str,
+        default="auto",
+        choices=["auto", "comgs", "irgs_refgs"],
+        help="Checkpoint format for --stage1_ckpt. Use irgs_refgs to load IRGS refgs checkpoints into COMGS stage2.",
+    )
     parser.add_argument("--sop_init", type=str, default="")
     parser.add_argument("--start_checkpoint", type=str, default="")
     parser.add_argument("--detect_anomaly", action="store_true", default=False)
@@ -664,11 +884,11 @@ def _build_parser() -> ArgumentParser:
     parser.add_argument("--save_debug_every", type=int, default=500)
     parser.add_argument("--summary_every", type=int, default=500)
     parser.add_argument("--material_lr", type=float, default=0.01)
-    parser.add_argument("--envmap_lr", type=float, default=0.01)
+    parser.add_argument("--envmap_lr", type=float, default=0.1)
     parser.add_argument("--sop_texture_lr", type=float, default=0.001)
-    parser.add_argument("--envmap_height", type=int, default=32)
-    parser.add_argument("--envmap_width", type=int, default=64)
-    parser.add_argument("--envmap_init_value", type=float, default=0.5)
+    parser.add_argument("--envmap_height", type=int, default=256)
+    parser.add_argument("--envmap_width", type=int, default=256)
+    parser.add_argument("--envmap_init_value", type=float, default=1.5)
     parser.add_argument("--envmap_activation", type=str, default="exp", choices=["exp", "softplus", "none"])
     parser.add_argument("--stage2_trace_ckpt", default="", type=str)
     parser.add_argument("--envmap_capture", default="", type=str)

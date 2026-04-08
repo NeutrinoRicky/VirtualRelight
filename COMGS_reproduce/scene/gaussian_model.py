@@ -39,6 +39,12 @@ class GaussianModel:
         self.covariance_activation = build_covariance_from_scaling_rotation
         self.opacity_activation = torch.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
+        self.base_color_activation = lambda x: torch.sigmoid(x) * 0.77 + 0.03
+        self.inverse_base_color_activation = lambda x: inverse_sigmoid(torch.clamp(x - 0.03, min=1e-6, max=1.0 - 1e-6)) / 0.77
+        self.metallic_activation = lambda x: torch.clamp(x, 0.0, 1.0)
+        self.inverse_metallic_activation = lambda x: torch.clamp(x, 0.0, 1.0)
+        self.roughness_activation = torch.sigmoid
+        self.inverse_roughness_activation = inverse_sigmoid
         self.rotation_activation = torch.nn.functional.normalize
 
     def __init__(self, sh_degree: int):
@@ -61,13 +67,58 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.setup_functions()
 
+    def _encode_visible_albedo(self, albedo: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        return self.inverse_base_color_activation(torch.clamp(albedo, min=0.03 + eps, max=0.80 - eps))
+
+    def _encode_visible_roughness(self, roughness: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        return self.inverse_roughness_activation(torch.clamp(roughness, min=eps, max=1.0 - eps))
+
+    def _encode_visible_metallic(self, metallic: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        del eps
+        return self.inverse_metallic_activation(metallic)
+
+    def _legacy_materials_look_visible(self) -> bool:
+        tensors = (self._albedo, self._roughness, self._metallic)
+        if any(not torch.is_tensor(t) or t.numel() == 0 for t in tensors):
+            return False
+        return all(
+            float(t.detach().min().item()) >= -1e-6 and float(t.detach().max().item()) <= 1.0 + 1e-6
+            for t in tensors
+        )
+
+    def _convert_legacy_visible_materials_to_raw(self, verbose: bool = False):
+        if not self._legacy_materials_look_visible():
+            return
+
+        if verbose:
+            print("[COMGS] Converting legacy visible-space albedo/roughness to raw parameterization while keeping metallic in visible space.")
+
+        self._albedo = nn.Parameter(self._encode_visible_albedo(self._albedo.detach()).requires_grad_(True))
+        self._roughness = nn.Parameter(self._encode_visible_roughness(self._roughness.detach()).requires_grad_(True))
+        self._metallic = nn.Parameter(torch.clamp(self._metallic.detach(), 0.0, 1.0).requires_grad_(True))
+
+    def _convert_raw_metallic_to_visible_if_needed(self, verbose: bool = False):
+        if not torch.is_tensor(self._metallic) or self._metallic.numel() == 0:
+            return
+
+        metallic = self._metallic.detach()
+        min_v = float(metallic.min().item())
+        max_v = float(metallic.max().item())
+        if min_v >= -1e-6 and max_v <= 1.0 + 1e-6:
+            return
+
+        if verbose:
+            print("[COMGS] Converting legacy raw-logit metallic tensor back to visible-space metallic.")
+
+        self._metallic = nn.Parameter(torch.sigmoid(metallic).requires_grad_(True))
+
     def _init_material_from_features(self):
         device = self._features_dc.device
         default_albedo = SH2RGB(self._features_dc[:, 0, :]).clamp(0.0, 1.0)
         default_roughness = torch.full((default_albedo.shape[0], 1), 0.9, dtype=torch.float, device=device)
         default_metallic = torch.zeros((default_albedo.shape[0], 1), dtype=torch.float, device=device)
-        self._albedo = nn.Parameter(default_albedo.requires_grad_(True))
-        self._roughness = nn.Parameter(default_roughness.requires_grad_(True))
+        self._albedo = nn.Parameter(self._encode_visible_albedo(default_albedo).requires_grad_(True))
+        self._roughness = nn.Parameter(self._encode_visible_roughness(default_roughness).requires_grad_(True))
         self._metallic = nn.Parameter(default_metallic.requires_grad_(True))
 
     def capture(self):
@@ -124,6 +175,8 @@ class GaussianModel:
                 opt_dict,
                 self.spatial_lr_scale,
             ) = model_args
+            self._convert_legacy_visible_materials_to_raw(verbose=True)
+            self._convert_raw_metallic_to_visible_if_needed(verbose=True)
 
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
@@ -157,15 +210,15 @@ class GaussianModel:
 
     @property
     def get_albedo(self):
-        return torch.clamp(self._albedo, 0.0, 1.0)
+        return self.base_color_activation(self._albedo)
 
     @property
     def get_roughness(self):
-        return torch.clamp(self._roughness, 0.0, 1.0)
+        return self.roughness_activation(self._roughness)
 
     @property
     def get_metallic(self):
-        return torch.clamp(self._metallic, 0.0, 1.0)
+        return self.metallic_activation(self._metallic)
 
     def get_covariance(self, scaling_modifier=1):
         return self.covariance_activation(self.get_xyz, self.get_scaling, scaling_modifier, self._rotation)
@@ -197,9 +250,13 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        self._albedo = nn.Parameter(fused_rgb.clamp(0.0, 1.0).requires_grad_(True))
-        self._roughness = nn.Parameter(torch.full((fused_point_cloud.shape[0], 1), 0.9, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._metallic = nn.Parameter(torch.zeros((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda").requires_grad_(True))
+        self._albedo = nn.Parameter(self._encode_visible_albedo(fused_rgb.clamp(0.0, 1.0)).requires_grad_(True))
+        self._roughness = nn.Parameter(
+            self._encode_visible_roughness(torch.full((fused_point_cloud.shape[0], 1), 0.9, dtype=torch.float, device="cuda")).requires_grad_(True)
+        )
+        self._metallic = nn.Parameter(
+            torch.zeros((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda").requires_grad_(True)
+        )
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def training_setup(self, training_args):
@@ -207,16 +264,21 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
+        feature_lr = getattr(training_args, "feature_lr", getattr(training_args, "features_lr", 0.0025))
+        albedo_lr = getattr(training_args, "albedo_lr", getattr(training_args, "base_color_lr", feature_lr))
+        roughness_lr = getattr(training_args, "roughness_lr", feature_lr)
+        metallic_lr = getattr(training_args, "metallic_lr", feature_lr)
+
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
-            {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
-            {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+            {'params': [self._features_dc], 'lr': feature_lr, "name": "f_dc"},
+            {'params': [self._features_rest], 'lr': feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-            {'params': [self._albedo], 'lr': training_args.feature_lr, "name": "albedo"},
-            {'params': [self._roughness], 'lr': training_args.feature_lr, "name": "roughness"},
-            {'params': [self._metallic], 'lr': training_args.feature_lr, "name": "metallic"},
+            {'params': [self._albedo], 'lr': albedo_lr, "name": "albedo"},
+            {'params': [self._roughness], 'lr': roughness_lr, "name": "roughness"},
+            {'params': [self._metallic], 'lr': metallic_lr, "name": "metallic"},
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -344,19 +406,26 @@ class GaussianModel:
 
         if albedo is None:
             default_albedo = SH2RGB(self._features_dc[:, 0, :]).clamp(0.0, 1.0)
-            self._albedo = nn.Parameter(default_albedo.requires_grad_(True))
+            self._albedo = nn.Parameter(self._encode_visible_albedo(default_albedo).requires_grad_(True))
         else:
             self._albedo = nn.Parameter(torch.tensor(albedo, dtype=torch.float, device="cuda").requires_grad_(True))
 
         if roughness is None:
-            self._roughness = nn.Parameter(torch.full((xyz.shape[0], 1), 0.9, dtype=torch.float, device="cuda").requires_grad_(True))
+            self._roughness = nn.Parameter(
+                self._encode_visible_roughness(torch.full((xyz.shape[0], 1), 0.9, dtype=torch.float, device="cuda")).requires_grad_(True)
+            )
         else:
             self._roughness = nn.Parameter(torch.tensor(roughness, dtype=torch.float, device="cuda").requires_grad_(True))
 
         if metallic is None:
-            self._metallic = nn.Parameter(torch.zeros((xyz.shape[0], 1), dtype=torch.float, device="cuda").requires_grad_(True))
+            self._metallic = nn.Parameter(
+                torch.zeros((xyz.shape[0], 1), dtype=torch.float, device="cuda").requires_grad_(True)
+            )
         else:
             self._metallic = nn.Parameter(torch.tensor(metallic, dtype=torch.float, device="cuda").requires_grad_(True))
+
+        self._convert_legacy_visible_materials_to_raw(verbose=True)
+        self._convert_raw_metallic_to_visible_if_needed(verbose=True)
 
         self.active_sh_degree = self.max_sh_degree
 

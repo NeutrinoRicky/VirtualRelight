@@ -17,7 +17,7 @@ from plyfile import PlyData
 
 from arguments import ModelParams, OptimizationParams, PipelineParams, get_combined_args
 from scene import GaussianModel, Scene
-from utils.deferred_pbr_comgs import LatLongEnvMap
+from utils.deferred_pbr_comgs import OctahedralEnvMap, load_envmap_capture_as_octahedral
 from utils.general_utils import safe_state
 from utils.sop_utils import build_octahedral_direction_grid, query_sops
 from utils.tracing_comgs import TraceBackendConfig, build_trace_backend
@@ -114,27 +114,41 @@ def _load_probe_data(path: Path) -> Tuple[np.ndarray, np.ndarray, Dict[str, obje
     raise ValueError(f"Unsupported probe file type: {path}")
 
 
-def _load_envmap(args) -> Tuple[LatLongEnvMap, Dict[str, object]]:
+def _load_envmap(args) -> Tuple[OctahedralEnvMap, Dict[str, object]]:
     if args.stage2_trace_ckpt:
         payload = torch.load(args.stage2_trace_ckpt)
         if not isinstance(payload, dict) or payload.get("format") != "comgs_stage2_trace_v1" or "envmap" not in payload:
             raise RuntimeError(f"{args.stage2_trace_ckpt} is not a valid Stage2 Trace checkpoint with envmap")
-        envmap = LatLongEnvMap.from_capture(payload["envmap"]).cuda()
+        envmap = load_envmap_capture_as_octahedral(
+            payload["envmap"],
+            height=args.envmap_height,
+            width=args.envmap_width,
+        ).cuda()
         return envmap, {
             "source": "stage2_trace_ckpt",
             "path": args.stage2_trace_ckpt,
             "iteration": int(payload.get("iteration", -1)),
+            "projection": "octahedral",
+            "height": int(envmap.height),
+            "width": int(envmap.width),
         }
 
     if args.envmap_capture:
         capture = torch.load(args.envmap_capture)
-        envmap = LatLongEnvMap.from_capture(capture).cuda()
+        envmap = load_envmap_capture_as_octahedral(
+            capture,
+            height=args.envmap_height,
+            width=args.envmap_width,
+        ).cuda()
         return envmap, {
             "source": "envmap_capture",
             "path": args.envmap_capture,
+            "projection": "octahedral",
+            "height": int(envmap.height),
+            "width": int(envmap.width),
         }
 
-    envmap = LatLongEnvMap(
+    envmap = OctahedralEnvMap(
         height=args.envmap_height,
         width=args.envmap_width,
         init_value=args.envmap_init_value,
@@ -142,6 +156,7 @@ def _load_envmap(args) -> Tuple[LatLongEnvMap, Dict[str, object]]:
     ).cuda()
     return envmap, {
         "source": "default_constant",
+        "projection": "octahedral",
         "height": int(args.envmap_height),
         "width": int(args.envmap_width),
         "init_value": float(args.envmap_init_value),
@@ -154,7 +169,7 @@ def init_sop_textures(
     probe_xyz: torch.Tensor,
     probe_normal: torch.Tensor,
     tracer,
-    envmap: LatLongEnvMap,
+    envmap: OctahedralEnvMap,
     tex_h: int = 16,
     tex_w: int = 16,
     probe_chunk_size: int = 128,
@@ -446,8 +461,8 @@ def _build_parser() -> ArgumentParser:
     parser.add_argument("--native_transmittance_min", type=float, default=0.03)
     parser.add_argument("--stage2_trace_ckpt", default="", type=str)
     parser.add_argument("--envmap_capture", default="", type=str)
-    parser.add_argument("--envmap_height", default=32, type=int)
-    parser.add_argument("--envmap_width", default=64, type=int)
+    parser.add_argument("--envmap_height", default=256, type=int)
+    parser.add_argument("--envmap_width", default=256, type=int)
     parser.add_argument("--envmap_init_value", default=0.5, type=float)
     parser.add_argument("--envmap_activation", default="exp", choices=["exp", "softplus", "none"])
     parser.add_argument("--preview_count", default=16, type=int)

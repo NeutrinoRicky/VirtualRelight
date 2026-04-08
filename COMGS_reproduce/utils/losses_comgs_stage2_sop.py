@@ -11,7 +11,7 @@ from utils.deferred_pbr_comgs import (
 )
 from utils.loss_utils import ssim
 from utils.losses_comgs_stage1 import compute_d2n_loss, compute_mask_loss
-from utils.sop_utils import query_sops_directional
+from utils.sop_utils import query_sops_directional, select_view_sop_neighbor_cache
 
 
 def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -78,14 +78,19 @@ def compute_stage2_sop_loss(
     randomized_samples: bool = True,
     weight_threshold: float = 1e-4,
     eps: float = 1e-6,
+    view_neighbor_cache: Dict[str, torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-    points, valid_mask = recover_shading_points(
-        view=viewpoint_camera,
-        depth_unbiased=render_pkg["depth_unbiased"],
-        weight=render_pkg["weight"],
-        weight_threshold=weight_threshold,
-        eps=eps,
-    )
+    if view_neighbor_cache is not None:
+        valid_mask = view_neighbor_cache["valid_mask"].to(device=gt_rgb.device)
+        points = None
+    else:
+        points, valid_mask = recover_shading_points(
+            view=viewpoint_camera,
+            depth_unbiased=render_pkg["depth_unbiased"],
+            weight=render_pkg["weight"],
+            weight_threshold=weight_threshold,
+            eps=eps,
+        )
 
     height, width = valid_mask.shape
     supervision_mask = _get_supervision_mask(viewpoint_camera, gt_rgb)
@@ -104,7 +109,6 @@ def compute_stage2_sop_loss(
     else:
         shading_idx = valid_idx
 
-    flat_points = points.reshape(-1, 3)
     flat_normals = F.normalize(render_pkg["normal"].permute(1, 2, 0).reshape(-1, 3), dim=-1, eps=eps)
     flat_albedo = render_pkg["albedo"].permute(1, 2, 0).reshape(-1, 3)
     flat_roughness = render_pkg["roughness"].permute(1, 2, 0).reshape(-1, 1)
@@ -121,7 +125,16 @@ def compute_stage2_sop_loss(
 
     if shading_idx.numel() > 0:
         # Gather per-pixel G-buffer values for the subset of shading points we supervise this iteration.
-        pts = flat_points[shading_idx]
+        if view_neighbor_cache is not None:
+            shading_neighbor_cache = select_view_sop_neighbor_cache(
+                view_neighbor_cache,
+                shading_idx,
+                device=gt_rgb.device,
+            )
+            pts = shading_neighbor_cache["points"]
+        else:
+            shading_neighbor_cache = None
+            pts = points.reshape(-1, 3)[shading_idx]
         nrm = flat_normals[shading_idx]
         albedo = flat_albedo[shading_idx]
         roughness = flat_roughness[shading_idx]
@@ -146,6 +159,7 @@ def compute_stage2_sop_loss(
             topk=sop_query_topk,
             eps=eps,
             chunk_size=sop_query_chunk_size,
+            neighbor_cache=shading_neighbor_cache,
         )
 
         # Eq. (8): Li = (1 - O) * Ldir + Lin

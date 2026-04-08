@@ -11,6 +11,7 @@
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
@@ -57,6 +58,30 @@ class Camera(nn.Module):
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+        self._build_ray_cache()
+
+    def _build_ray_cache(self):
+        v, u = torch.meshgrid(
+            torch.arange(self.image_height, device="cuda"),
+            torch.arange(self.image_width, device="cuda"),
+            indexing="ij",
+        )
+        focal_x = self.image_width / (2 * np.tan(self.FoVx * 0.5))
+        focal_y = self.image_height / (2 * np.tan(self.FoVy * 0.5))
+        rays_d_camera = torch.stack(
+            [
+                (u - self.image_width / 2 + 0.5) / focal_x,
+                (v - self.image_height / 2 + 0.5) / focal_y,
+                torch.ones_like(u),
+            ],
+            dim=-1,
+        ).reshape(-1, 3)
+        rays_d = rays_d_camera @ self.world_view_transform[:3, :3].T
+        self.rays_d_unnormalized = rays_d
+        self.rays_d = F.normalize(rays_d, dim=-1)
+        self.rays_o = self.camera_center[None].expand_as(self.rays_d)
+        self.rays_d_hw = self.rays_d.reshape(self.image_height, self.image_width, 3)
+        self.rays_d_hw_unnormalized = rays_d.reshape(self.image_height, self.image_width, 3)
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
@@ -70,4 +95,27 @@ class MiniCam:
         self.full_proj_transform = full_proj_transform
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
+        self._build_ray_cache()
 
+    def _build_ray_cache(self):
+        v, u = torch.meshgrid(
+            torch.arange(self.image_height, device=self.world_view_transform.device),
+            torch.arange(self.image_width, device=self.world_view_transform.device),
+            indexing="ij",
+        )
+        focal_x = self.image_width / (2 * np.tan(self.FoVx * 0.5))
+        focal_y = self.image_height / (2 * np.tan(self.FoVy * 0.5))
+        rays_d_camera = torch.stack(
+            [
+                (u - self.image_width / 2 + 0.5) / focal_x,
+                (v - self.image_height / 2 + 0.5) / focal_y,
+                torch.ones_like(u),
+            ],
+            dim=-1,
+        ).reshape(-1, 3)
+        rays_d = rays_d_camera @ self.world_view_transform[:3, :3].T
+        self.rays_d_unnormalized = rays_d
+        self.rays_d = F.normalize(rays_d, dim=-1)
+        self.rays_o = self.camera_center[None].expand_as(self.rays_d)
+        self.rays_d_hw = self.rays_d.reshape(self.image_height, self.image_width, 3)
+        self.rays_d_hw_unnormalized = rays_d.reshape(self.image_height, self.image_width, 3)
