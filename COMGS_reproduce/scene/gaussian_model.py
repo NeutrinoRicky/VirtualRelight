@@ -116,7 +116,7 @@ class GaussianModel:
         device = self._features_dc.device
         default_albedo = SH2RGB(self._features_dc[:, 0, :]).clamp(0.0, 1.0)
         default_roughness = torch.full((default_albedo.shape[0], 1), 0.9, dtype=torch.float, device=device)
-        default_metallic = torch.zeros((default_albedo.shape[0], 1), dtype=torch.float, device=device)
+        default_metallic = torch.full((default_albedo.shape[0], 1), 0.2, dtype=torch.float, device=device)
         self._albedo = nn.Parameter(self._encode_visible_albedo(default_albedo).requires_grad_(True))
         self._roughness = nn.Parameter(self._encode_visible_roughness(default_roughness).requires_grad_(True))
         self._metallic = nn.Parameter(default_metallic.requires_grad_(True))
@@ -419,7 +419,7 @@ class GaussianModel:
 
         if metallic is None:
             self._metallic = nn.Parameter(
-                torch.zeros((xyz.shape[0], 1), dtype=torch.float, device="cuda").requires_grad_(True)
+                torch.full((xyz.shape[0], 1), 0.2, dtype=torch.float, device="cuda").requires_grad_(True)
             )
         else:
             self._metallic = nn.Parameter(torch.tensor(metallic, dtype=torch.float, device="cuda").requires_grad_(True))

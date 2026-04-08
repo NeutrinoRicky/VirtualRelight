@@ -8,8 +8,9 @@ from utils.deferred_pbr_comgs import (
     integrate_incident_radiance,
     recover_shading_points,
     rgb_to_srgb,
-    sample_incident_rays_irgs,
+    sample_hemisphere_hammersley,
 )
+from utils.losses_comgs_stage1 import compute_mask_loss
 from utils.loss_utils import ssim
 
 
@@ -64,11 +65,6 @@ def _get_supervision_mask(viewpoint_camera, ref_tensor: torch.Tensor):
         ).squeeze(0)
 
     return torch.clamp(mask.to(device=ref_tensor.device, dtype=ref_tensor.dtype), 0.0, 1.0)
-
-
-def _compute_mask_entropy_loss(weight: torch.Tensor, gt_mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    o = weight.clamp(eps, 1.0 - eps)
-    return -(gt_mask * torch.log(o) + (1.0 - gt_mask) * torch.log(1.0 - o)).mean()
 
 
 def _get_env_only_image(viewpoint_camera, envmap, ref_tensor: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -173,10 +169,10 @@ def compute_stage2_trace_loss(
         metallic = flat_metallic[trace_idx]
         viewdirs = compute_view_directions(pts, viewpoint_camera.camera_center)
 
-        lightdirs, incident_areas = sample_incident_rays_irgs(
+        lightdirs, _pdf, sample_solid_angle = sample_hemisphere_hammersley(
             normals=nrm,
-            training=randomized_samples,
-            sample_num=num_shading_samples,
+            num_samples=num_shading_samples,
+            randomized=randomized_samples,
         )
         ray_origins = pts[:, None, :] + lightdirs * trace_bias
 
@@ -192,7 +188,6 @@ def compute_stage2_trace_loss(
         direct_radiance = envmap(lightdirs)
         incident_radiance = (1.0 - trace_outputs["occlusion"]) * direct_radiance + trace_outputs["incident_radiance"]
 
-        sample_solid_angle = incident_areas.new_tensor((2.0 * 3.141592653589793) / float(max(incident_areas.shape[1], 1)))
         pbr_linear, pbr_aux = integrate_incident_radiance(
             albedo=albedo,
             roughness=roughness,
@@ -263,7 +258,7 @@ def compute_stage2_trace_loss(
         loss_d2n = gt_rgb.new_tensor(0.0)
 
     if use_mask_loss and getattr(viewpoint_camera, "gt_alpha_mask", None) is not None:
-        loss_mask = _compute_mask_entropy_loss(render_pkg["rend_alpha"], supervision_mask, eps=eps)
+        loss_mask = compute_mask_loss(render_pkg["weight"], viewpoint_camera.gt_alpha_mask, eps=eps)
     else:
         loss_mask = gt_rgb.new_tensor(0.0)
 

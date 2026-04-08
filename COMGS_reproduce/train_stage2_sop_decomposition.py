@@ -208,11 +208,11 @@ def _describe_model_args(model_args) -> str:
 
 def _convert_irgs_refgs_model_args(model_args, fallback_optimizer_state, gaussians: GaussianModel):
     # Discard RefGS material tensors and reinitialize stage2 materials.
-    # Keep albedo/roughness aligned with IRGS stage2 defaults, but restore
-    # metallic to the original COMGS visible-space zero init.
+    # Keep the material hyperparameters in a similar range instead of pushing
+    # metallic all the way to zero.
     irgs_init_albedo = 0.3
     irgs_init_roughness = 0.7
-    irgs_init_metallic = 0.0
+    irgs_init_metallic = 0.2
 
     if not isinstance(model_args, (tuple, list)) or len(model_args) != 19:
         raise RuntimeError(

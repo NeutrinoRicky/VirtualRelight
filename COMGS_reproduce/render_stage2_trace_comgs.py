@@ -16,7 +16,7 @@ from utils.deferred_pbr_comgs import (
     load_envmap_capture_as_octahedral,
     recover_shading_points,
     rgb_to_srgb,
-    sample_incident_rays_irgs,
+    sample_hemisphere_hammersley,
 )
 from utils.general_utils import safe_state
 from utils.tracing_comgs import TraceBackendConfig, build_trace_backend
@@ -162,10 +162,10 @@ def render_stage2_trace_view(
         metallic = flat_metallic[chunk_idx]
         viewdirs = compute_view_directions(pts, viewpoint_cam.camera_center)
 
-        lightdirs, incident_areas = sample_incident_rays_irgs(
+        lightdirs, _pdf, sample_solid_angle = sample_hemisphere_hammersley(
             normals=nrm,
-            training=randomized_samples,
-            sample_num=num_shading_samples,
+            num_samples=num_shading_samples,
+            randomized=randomized_samples,
         )
         ray_origins = pts[:, None, :] + lightdirs * trace_bias
         trace_outputs = trace_backend.trace(
@@ -181,7 +181,6 @@ def render_stage2_trace_view(
         # Keep render-time incident lighting consistent with stage2 training:
         # L_i = (1 - O) * L_dir + L_ind.
         incident_radiance = (1.0 - trace_outputs["occlusion"]) * direct_radiance + trace_outputs["incident_radiance"]
-        sample_solid_angle = incident_areas.new_tensor((2.0 * 3.141592653589793) / float(max(incident_areas.shape[1], 1)))
         pbr_linear, _aux = integrate_incident_radiance(
             albedo=albedo,
             roughness=roughness,

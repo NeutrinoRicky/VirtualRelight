@@ -231,7 +231,13 @@ CUDA_VISIBLE_DEVICES=0 python render_stage2_sop_importance_sample_object_comgs.p
 输出为./output/TensorIR/stage2/lego_from_refgs
 环境光照可能有问题，要重新train一下
 TODO：注意 采样从原来的 Hammersley 改成了 IRGS 的 Fibonacci hemisphere sampling，需要修改回来 metallic的初始化也有问题，需要修改
-CUDA_VISIBLE_DEVICES=0 python /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_reproduce/train_stage2_trace_comgs.py \
+d2n 改成 IRGS 的 rend_normal 对 surf_normal，并且从 iteration > 1000 才启用，losses_comgs_stage2_trace.py (line 253) 和 train_stage2_trace_comgs.py (line 539)。
+light_smooth 改成对当前视角的 env_only 图做 TV，而不是直接对 env 参数图做 TV，losses_comgs_stage2_trace.py (line 74) 和 losses_comgs_stage2_trace.py (line 292)。
+render_multitarget 的 normal map 也补成了 rend_normal / alpha 后再 normalize，和 IRGS normal_map 对齐，gaussian_renderer/init.py#L245 (line 245)。
+默认 lambda_lam 现在是 0.0，不再额外带一个 IRGS 没有的材质先验，train_stage2_trace_comgs.py (line 537)。
+
+
+CUDA_VISIBLE_DEVICES=1 python /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_reproduce/train_stage2_trace_comgs.py \
   -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/lego \
   -m /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_reproduce/output/TensorIR/lego \
   --stage1_ckpt /mnt/store/fd/project/StaticReconstruction/IRGS/outputs/TensoIR_Synthetic/lego/refgs/chkpnt50000.pth \
