@@ -67,6 +67,37 @@ def _resolve_trace_samples_per_point(stage2_args) -> int:
     return max(stage2_args.num_shading_samples, 1)
 
 
+IRGS_STAGE2_POSITION_LR = 0.0
+IRGS_STAGE2_OPACITY_LR = 0.0
+IRGS_STAGE2_SCALING_LR = 0.0
+IRGS_STAGE2_ROTATION_LR = 0.0
+IRGS_STAGE2_FEATURE_DC_LR = 0.0075
+IRGS_STAGE2_FEATURE_REST_LR = IRGS_STAGE2_FEATURE_DC_LR / 20.0
+
+
+def _apply_irgs_stage2_optimizer_policy(opt, stage2_args):
+    # Match IRGS stage2: geometry frozen, SH colors trainable, fixed SH LRs.
+    enforced = {
+        "position_lr_init": IRGS_STAGE2_POSITION_LR,
+        "position_lr_final": IRGS_STAGE2_POSITION_LR,
+        "opacity_lr": IRGS_STAGE2_OPACITY_LR,
+        "scaling_lr": IRGS_STAGE2_SCALING_LR,
+        "rotation_lr": IRGS_STAGE2_ROTATION_LR,
+        "feature_lr": IRGS_STAGE2_FEATURE_DC_LR,
+    }
+    for obj in (opt, stage2_args):
+        for key, value in enforced.items():
+            if hasattr(obj, key):
+                setattr(obj, key, value)
+
+    if getattr(stage2_args, "freeze_geometry", True) is not True:
+        print("[Stage2-Trace] Overriding geometry flags to keep xyz/scaling/rotation/opacity frozen, matching IRGS stage2.")
+    if getattr(stage2_args, "freeze_color", False) is not False:
+        print("[Stage2-Trace] Overriding color flags to keep SH colors trainable, matching IRGS stage2.")
+
+    stage2_args.freeze_geometry = True
+    stage2_args.freeze_color = False
+
 
 def _set_requires_grad(group, value: bool):
     for param in group["params"]:
@@ -79,17 +110,16 @@ def configure_stage2_gaussian_optimizer(gaussians: GaussianModel, args):
     color_names = {"f_dc", "f_rest"}
     material_names = {"albedo", "roughness", "metallic"}
 
-    feature_lr = getattr(args, "feature_lr", 0.0025)
     material_lr = getattr(args, "material_lr", None)
-    albedo_lr = getattr(args, "albedo_lr", material_lr if material_lr is not None else feature_lr)
-    roughness_lr = getattr(args, "roughness_lr", material_lr if material_lr is not None else feature_lr)
-    metallic_lr = getattr(args, "metallic_lr", material_lr if material_lr is not None else feature_lr)
+    albedo_lr = getattr(args, "albedo_lr", material_lr if material_lr is not None else IRGS_STAGE2_FEATURE_DC_LR)
+    roughness_lr = getattr(args, "roughness_lr", material_lr if material_lr is not None else IRGS_STAGE2_FEATURE_DC_LR)
+    metallic_lr = getattr(args, "metallic_lr", material_lr if material_lr is not None else IRGS_STAGE2_FEATURE_DC_LR)
     default_group_lrs = {
-        "f_dc": feature_lr,
-        "f_rest": feature_lr / 20.0,
-        "opacity": args.opacity_lr,
-        "scaling": args.scaling_lr,
-        "rotation": args.rotation_lr,
+        "f_dc": IRGS_STAGE2_FEATURE_DC_LR,
+        "f_rest": IRGS_STAGE2_FEATURE_REST_LR,
+        "opacity": IRGS_STAGE2_OPACITY_LR,
+        "scaling": IRGS_STAGE2_SCALING_LR,
+        "rotation": IRGS_STAGE2_ROTATION_LR,
         "albedo": albedo_lr,
         "roughness": roughness_lr,
         "metallic": metallic_lr,
@@ -98,17 +128,11 @@ def configure_stage2_gaussian_optimizer(gaussians: GaussianModel, args):
     for group in gaussians.optimizer.param_groups:
         name = group["name"]
         if name in geometry_names:
-            _set_requires_grad(group, not args.freeze_geometry)
-            if args.freeze_geometry:
-                group["lr"] = 0.0
-            elif name != "xyz":
-                group["lr"] = default_group_lrs[name]
+            _set_requires_grad(group, False)
+            group["lr"] = 0.0
         elif name in color_names:
-            _set_requires_grad(group, not args.freeze_color)
-            if args.freeze_color:
-                group["lr"] = 0.0
-            else:
-                group["lr"] = default_group_lrs[name]
+            _set_requires_grad(group, True)
+            group["lr"] = default_group_lrs[name]
         elif name in material_names:
             _set_requires_grad(group, True)
             group["lr"] = default_group_lrs[name]
@@ -327,6 +351,7 @@ def save_stage2_trace_debug(output_root, iteration, view_name, gt_rgb, render_pk
 
 def training_stage2_trace(dataset, opt, pipe, stage2_args):
     tb_writer = prepare_output_and_logger(dataset)
+    _apply_irgs_stage2_optimizer_policy(opt, stage2_args)
 
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
@@ -567,7 +592,16 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
-    parser.set_defaults(iterations=2000, position_lr_max_steps=2000, feature_lr=0.0075)
+    parser.set_defaults(
+        iterations=2000,
+        position_lr_max_steps=2000,
+        position_lr_init=IRGS_STAGE2_POSITION_LR,
+        position_lr_final=IRGS_STAGE2_POSITION_LR,
+        opacity_lr=IRGS_STAGE2_OPACITY_LR,
+        scaling_lr=IRGS_STAGE2_SCALING_LR,
+        rotation_lr=IRGS_STAGE2_ROTATION_LR,
+        feature_lr=IRGS_STAGE2_FEATURE_DC_LR,
+    )
 
     parser.add_argument("--stage1_ckpt", type=str, required=True)
     parser.add_argument(

@@ -298,24 +298,28 @@ CUDA_VISIBLE_DEVICES=1 python train_stage2_trace_comgs.py \
 
 CUDA_VISIBLE_DEVICES=3 python train_stage2_trace_comgs.py \
   -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/lego \
-  -m ./output/TensorIR/lego/stage2/trace \
+  -m ./output/TensorIR/lego/stage2/trace_v2 \
   --stage1_ckpt /mnt/store/fd/project/StaticReconstruction/IRGS/outputs/TensoIR_Synthetic/lego/refgs/chkpnt50000.pth \
   --trace_backend irgs_adapter_compat \
   --shading_mode irgs_compat \
   --trace_feature_mode irgs_base_rough \
   --diffuse_sample_num 128 \
-  --iterations 20000
+  --iterations 5000 \
+  --use_irgs_mixture_sampling \
+  --light_sample_num 256 \
+  --trace_rebuild_every 1 \
+
 
 
 CUDA_VISIBLE_DEVICES=1 python render_stage2_trace_comgs.py \
   -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/lego \
-  -m ./output/TensorIR/lego/stage2/trace \
-  --checkpoint ./output/TensorIR/lego/stage2/trace/object_step2_trace.ckpt \
+  -m ./output/TensorIR/lego/stage2/trace_v2 \
+  --checkpoint ./output/TensorIR/lego/stage2/trace_v2/object_step2_trace.ckpt \
   --split test \
   --eval \
   --export_mask_mode render \
 
-CUDA_VISIBLE_DEVICES=1 python metrics.py -m /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_reproduce/output/TensorIR/lego/stage2/trace/stage2_trace_render --render_suffix _rgb_raw.png --max_frames 10
+CUDA_VISIBLE_DEVICES=1 python metrics.py -m /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_reproduce/output/TensorIR/lego/stage2/trace_v2/stage2_trace_render --render_suffix _rgb_raw.png --max_frames 10
 SOP 训练 训练效率是上来了,但albedo还是过高,可能环境光的学习率得改
 先初始化SOP，再初始化探针材质
 CUDA_VISIBLE_DEVICES=1 python SOP/phase1_initializer.py \
@@ -377,3 +381,5 @@ CUDA_VISIBLE_DEVICES=3 python render_stage2_sop_importance_sample_object_comgs.p
   --disable_sample_jitter
 
 CUDA_VISIBLE_DEVICES=1 python metrics.py -m /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_reproduce/output/TensorIR/lego/stage2/sop/stage2_sop_render
+
+git push github master
