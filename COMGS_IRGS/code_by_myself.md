@@ -1,0 +1,4 @@
+CUDA_VISIBLE_DEVICES=3 python train.py -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/lego --eval -m ./outputs/TensoIR_Synthetic/lego/irgs  -w --iterations 20000 --start_checkpoint_refgs /mnt/store/fd/project/StaticReconstruction/IRGS/outputs/TensoIR_Synthetic/lego/refgs/chkpnt50000.pth --envmap_resolution 128 --lambda_base_color_smooth 2 --lambda_roughness_smooth 0.1 --diffuse_sample_num 256 --envmap_cubemap_lr 0.01 --lambda_light_smooth 0.05 --init_roughness_value 0.8 --lambda_light 0.5 --train_ray
+
+CUDA_VISIBLE_DEVICES=0 python render.py -m ./outputs/TensoIR_Synthetic/lego/irgs --eval --diffuse_sample_num 256 --skip_train
+CUDA_VISIBLE_DEVICES=0 python render.py -m ./outputs/TensoIR_Synthetic/lego/irgs --eval --diffuse_sample_num 256 --skip_train --first_k 10
