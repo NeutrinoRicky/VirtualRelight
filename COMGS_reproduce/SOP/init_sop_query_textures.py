@@ -39,20 +39,141 @@ def _repeat_single_channel(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-def _load_gaussians_from_checkpoint(gaussians: GaussianModel, opt, checkpoint_path: str) -> Tuple[int, str]:
-    payload = torch.load(checkpoint_path)
-    if isinstance(payload, dict) and "gaussians" in payload:
-        model_params = payload["gaussians"]
-        iteration = int(payload.get("iteration", 0))
-        label = payload.get("format", "checkpoint_dict")
-    elif isinstance(payload, (tuple, list)) and len(payload) >= 2:
-        model_params = payload[0]
-        iteration = int(payload[1])
-        label = "stage1_checkpoint"
-    else:
-        raise ValueError(f"Unsupported checkpoint format: {checkpoint_path}")
+def _cuda_checkpoint_map_location():
+    if not torch.cuda.is_available():
+        return "cpu"
+    return torch.device("cuda")
 
+
+def _clone_tensor(x):
+    if torch.is_tensor(x):
+        return x.detach().clone()
+    return x
+
+
+def _clone_trainable_parameter(x: torch.Tensor) -> torch.nn.Parameter:
+    return torch.nn.Parameter(x.detach().clone().requires_grad_(True))
+
+
+def _encode_visible_material_like(gaussians: GaussianModel, template: torch.Tensor, value: float, material_name: str) -> torch.nn.Parameter:
+    visible = torch.full_like(template, float(value))
+    if material_name == "albedo":
+        raw = gaussians._encode_visible_albedo(visible)
+    elif material_name == "roughness":
+        raw = gaussians._encode_visible_roughness(visible)
+    elif material_name == "metallic":
+        raw = gaussians._encode_visible_metallic(visible)
+    else:
+        raise ValueError(f"Unsupported material name: {material_name}")
+    return _clone_trainable_parameter(raw)
+
+
+def _describe_model_args(model_args) -> str:
+    if isinstance(model_args, (tuple, list)):
+        return f"{type(model_args).__name__}(len={len(model_args)})"
+    return type(model_args).__name__
+
+
+def _convert_irgs_refgs_model_args(model_args, fallback_optimizer_state, gaussians: GaussianModel):
+    # RefGS materials do not map 1:1 to COMGS visible-material parameters, so
+    # restore geometry/SH and initialize visible materials in a stable range.
+    irgs_init_albedo = 0.3
+    irgs_init_roughness = 0.7
+    irgs_init_metallic = 0.2
+
+    if not isinstance(model_args, (tuple, list)) or len(model_args) != 19:
+        raise RuntimeError(
+            "IRGS refgs checkpoint should store model params as a tuple/list with len=19, "
+            f"but got {_describe_model_args(model_args)}."
+        )
+
+    (
+        active_sh_degree,
+        xyz,
+        metallic_raw,
+        roughness_raw,
+        base_color_raw,
+        features_dc,
+        features_rest,
+        _indirect_dc,
+        _indirect_rest,
+        scaling,
+        rotation,
+        opacity,
+        max_radii2D,
+        xyz_gradient_accum,
+        denom,
+        _opt_dict,
+        _env_map_1,
+        _env_map_2,
+        spatial_lr_scale,
+    ) = model_args
+
+    return (
+        int(active_sh_degree),
+        _clone_trainable_parameter(xyz),
+        _clone_trainable_parameter(features_dc),
+        _clone_trainable_parameter(features_rest),
+        _clone_trainable_parameter(scaling),
+        _clone_trainable_parameter(rotation),
+        _clone_trainable_parameter(opacity),
+        _encode_visible_material_like(gaussians, base_color_raw, irgs_init_albedo, "albedo"),
+        _encode_visible_material_like(gaussians, roughness_raw, irgs_init_roughness, "roughness"),
+        _encode_visible_material_like(gaussians, metallic_raw, irgs_init_metallic, "metallic"),
+        _clone_tensor(max_radii2D),
+        _clone_tensor(xyz_gradient_accum),
+        _clone_tensor(denom),
+        fallback_optimizer_state,
+        float(spatial_lr_scale),
+    )
+
+
+def _resolve_checkpoint_model_args(gaussians: GaussianModel, checkpoint_path: str, checkpoint_format: str):
+    payload = torch.load(checkpoint_path, map_location=_cuda_checkpoint_map_location())
+    if isinstance(payload, dict) and "gaussians" in payload:
+        return payload["gaussians"], int(payload.get("iteration", 0)), payload.get("format", "checkpoint_dict")
+
+    if not isinstance(payload, (tuple, list)) or len(payload) < 1:
+        raise RuntimeError(f"Unsupported checkpoint payload type for {checkpoint_path}: {type(payload).__name__}")
+
+    model_args = payload[0]
+    iteration = int(payload[1]) if len(payload) >= 2 else 0
+
+    if checkpoint_format == "comgs":
+        if not isinstance(model_args, (tuple, list)) or len(model_args) not in {12, 15}:
+            raise RuntimeError(
+                "Expected a COMGS checkpoint with model params len=12 or len=15, "
+                f"but got {_describe_model_args(model_args)} from {checkpoint_path}."
+            )
+        return model_args, iteration, "comgs_stage1"
+
+    if checkpoint_format == "irgs_refgs":
+        return (
+            _convert_irgs_refgs_model_args(model_args, gaussians.optimizer.state_dict(), gaussians),
+            iteration,
+            "irgs_refgs_compat",
+        )
+
+    if isinstance(model_args, (tuple, list)) and len(model_args) in {12, 15}:
+        return model_args, iteration, "comgs_stage1"
+
+    if isinstance(model_args, (tuple, list)) and len(model_args) == 19:
+        return (
+            _convert_irgs_refgs_model_args(model_args, gaussians.optimizer.state_dict(), gaussians),
+            iteration,
+            "irgs_refgs_compat",
+        )
+
+    raise RuntimeError(
+        "Unable to auto-detect checkpoint format for "
+        f"{checkpoint_path}: got {_describe_model_args(model_args)}. "
+        "Try --checkpoint_format comgs or --checkpoint_format irgs_refgs."
+    )
+
+
+def _load_gaussians_from_checkpoint(gaussians: GaussianModel, opt, checkpoint_path: str, checkpoint_format: str = "auto") -> Tuple[int, str]:
     gaussians.training_setup(opt)
+    model_params, iteration, label = _resolve_checkpoint_model_args(gaussians, checkpoint_path, checkpoint_format)
     gaussians.restore(model_params, opt)
     return iteration, label
 
@@ -341,9 +462,16 @@ def initialize_sop_query_textures(args) -> Dict[str, object]:
 
     gaussians = GaussianModel(dataset.sh_degree)
     checkpoint_path = getattr(args, "checkpoint", "")
+    checkpoint_format = getattr(args, "checkpoint_format", "auto")
     if checkpoint_path:
+        _ensure_dir(Path(dataset.model_path))
         scene = Scene(dataset, gaussians, shuffle=False)
-        ckpt_iteration, ckpt_label = _load_gaussians_from_checkpoint(gaussians, opt, checkpoint_path)
+        ckpt_iteration, ckpt_label = _load_gaussians_from_checkpoint(
+            gaussians,
+            opt,
+            checkpoint_path,
+            checkpoint_format=checkpoint_format,
+        )
         loaded_from = {
             "source": "checkpoint",
             "path": checkpoint_path,
@@ -441,6 +569,15 @@ def _build_parser() -> ArgumentParser:
     OptimizationParams(parser)
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--checkpoint", default="", type=str)
+    parser.add_argument(
+        "--checkpoint_format",
+        "--stage1_ckpt_format",
+        dest="checkpoint_format",
+        default="auto",
+        type=str,
+        choices=["auto", "comgs", "irgs_refgs"],
+        help="Checkpoint format for --checkpoint. Use irgs_refgs to load IRGS refgs checkpoints into SOP query initialization.",
+    )
     parser.add_argument("--probe_file", default="", type=str)
     parser.add_argument("--output_dir", default="", type=str)
     parser.add_argument("--tex_h", default=16, type=int)

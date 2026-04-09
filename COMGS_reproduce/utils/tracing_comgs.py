@@ -34,7 +34,13 @@ class BaseTraceBackend:
     def rebuild(self, *args, **kwargs):
         raise NotImplementedError
 
-    def _trace_hits_flat(self, rays_o: torch.Tensor, rays_d: torch.Tensor, camera_center: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+    def _trace_hits_flat(
+        self,
+        rays_o: torch.Tensor,
+        rays_d: torch.Tensor,
+        camera_center: Optional[torch.Tensor] = None,
+        trace_feature_mode: Optional[str] = None,
+    ) -> Dict[str, torch.Tensor]:
         raise NotImplementedError
 
     def trace(
@@ -45,11 +51,17 @@ class BaseTraceBackend:
         secondary_num_samples: int = 16,
         randomized_secondary: bool = False,
         camera_center: Optional[torch.Tensor] = None,
+        trace_feature_mode: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
         prefix = ray_origins.shape[:-1]
         rays_o = ray_origins.reshape(-1, 3)
         rays_d = F.normalize(ray_directions.reshape(-1, 3), dim=-1, eps=1e-6)
-        hits = self._trace_hits_flat(rays_o, rays_d, camera_center=camera_center)
+        hits = self._trace_hits_flat(
+            rays_o,
+            rays_d,
+            camera_center=camera_center,
+            trace_feature_mode=trace_feature_mode,
+        )
 
         hit_mask = hits["hit_mask"]
         incident = torch.zeros((rays_o.shape[0], 3), device=rays_o.device, dtype=rays_o.dtype)
@@ -101,6 +113,7 @@ class BaseTraceBackend:
         secondary_num_samples: int = 16,
         randomized_secondary: bool = False,
         camera_center: Optional[torch.Tensor] = None,
+        trace_feature_mode: Optional[str] = None,
     ) -> torch.Tensor:
         return self.trace(
             ray_origins=ray_origins,
@@ -109,6 +122,7 @@ class BaseTraceBackend:
             secondary_num_samples=secondary_num_samples,
             randomized_secondary=randomized_secondary,
             camera_center=camera_center,
+            trace_feature_mode=trace_feature_mode,
         )["incident_radiance"]
 
 
@@ -129,11 +143,18 @@ class IRGSNativeGaussianTraceBackend(BaseTraceBackend):
             self.gaussians = gaussians
         self.adapter.rebuild(gaussians=self.gaussians)
 
-    def _trace_hits_flat(self, rays_o: torch.Tensor, rays_d: torch.Tensor, camera_center: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+    def _trace_hits_flat(
+        self,
+        rays_o: torch.Tensor,
+        rays_d: torch.Tensor,
+        camera_center: Optional[torch.Tensor] = None,
+        trace_feature_mode: Optional[str] = None,
+    ) -> Dict[str, torch.Tensor]:
         trace_outputs = self.adapter.trace(
             ray_origins=rays_o,
             ray_directions=rays_d,
             camera_center=camera_center,
+            feature_mode=trace_feature_mode or "comgs_pbr",
         )
 
         return {
@@ -150,6 +171,7 @@ class IRGSNativeGaussianTraceBackend(BaseTraceBackend):
 
 class IRGSAdapterTraceBackend(BaseTraceBackend):
     backend_name = "irgs_adapter"
+    default_feature_mode = "comgs_pbr"
 
     def __init__(self, gaussians, alpha_min: float = 1.0 / 255.0, transmittance_min: float = 0.03):
         self.gaussians = gaussians
@@ -165,11 +187,35 @@ class IRGSAdapterTraceBackend(BaseTraceBackend):
             self.gaussians = gaussians
         self.adapter.rebuild(gaussians=self.gaussians)
 
-    def _trace_hits_flat(self, rays_o: torch.Tensor, rays_d: torch.Tensor, camera_center: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        trace_outputs = self.adapter.trace(
+    def _resolve_feature_mode(self, trace_feature_mode: Optional[str]) -> str:
+        return trace_feature_mode or self.default_feature_mode
+
+    def _adapter_trace(
+        self,
+        rays_o: torch.Tensor,
+        rays_d: torch.Tensor,
+        camera_center: Optional[torch.Tensor] = None,
+        trace_feature_mode: Optional[str] = None,
+    ) -> Dict[str, torch.Tensor]:
+        return self.adapter.trace(
             ray_origins=rays_o,
             ray_directions=rays_d,
             camera_center=camera_center,
+            feature_mode=self._resolve_feature_mode(trace_feature_mode),
+        )
+
+    def _trace_hits_flat(
+        self,
+        rays_o: torch.Tensor,
+        rays_d: torch.Tensor,
+        camera_center: Optional[torch.Tensor] = None,
+        trace_feature_mode: Optional[str] = None,
+    ) -> Dict[str, torch.Tensor]:
+        trace_outputs = self._adapter_trace(
+            rays_o=rays_o,
+            rays_d=rays_d,
+            camera_center=camera_center,
+            trace_feature_mode=trace_feature_mode,
         )
         return {
             "hit_mask": trace_outputs["hit_mask"],
@@ -191,12 +237,14 @@ class IRGSAdapterTraceBackend(BaseTraceBackend):
         secondary_num_samples: int = 16,
         randomized_secondary: bool = False,
         camera_center: Optional[torch.Tensor] = None,
+        trace_feature_mode: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
         del envmap, secondary_num_samples, randomized_secondary
-        trace_outputs = self.adapter.trace(
-            ray_origins=ray_origins,
-            ray_directions=ray_directions,
+        trace_outputs = self._adapter_trace(
+            rays_o=ray_origins,
+            rays_d=ray_directions,
             camera_center=camera_center,
+            trace_feature_mode=trace_feature_mode,
         )
         return {
             "occlusion": trace_outputs["alpha"].unsqueeze(-1),
@@ -224,6 +272,11 @@ class IRGSAdapterTraceBackend(BaseTraceBackend):
             camera_center=camera_center,
         )
         return trace_outputs["alpha"].unsqueeze(-1)
+
+
+class IRGSAdapterCompatTraceBackend(IRGSAdapterTraceBackend):
+    backend_name = "irgs_adapter_compat"
+    default_feature_mode = "irgs_base_rough"
 
 
 class Open3DMeshTraceBackend(BaseTraceBackend):
@@ -403,6 +456,16 @@ def build_trace_backend(config: TraceBackendConfig, scene, gaussians, pipe, back
     adapter_error = None
     native_error = None
     open3d_error = None
+
+    if requested in ("irgs_adapter_compat",):
+        backend = IRGSAdapterCompatTraceBackend(
+            gaussians=gaussians,
+            alpha_min=config.native_alpha_min,
+            transmittance_min=config.native_transmittance_min,
+        )
+        backend.rebuild(gaussians)
+        print("[Stage2-Trace] Using IRGS adapter compatibility backend.")
+        return backend
 
     if requested in ("auto", "irgs", "irgs_adapter"):
         try:

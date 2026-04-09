@@ -51,6 +51,22 @@ def _tonemap_for_vis(x):
     return torch.clamp(y / (1.0 + y), 0.0, 1.0)
 
 
+def _save_image_if_present(image: Optional[torch.Tensor], path: str, tonemap: bool = False):
+    if image is None:
+        return
+    if tonemap:
+        image = _tonemap_for_vis(image)
+    torchvision.utils.save_image(torch.clamp(image, 0.0, 1.0), path)
+
+
+def _resolve_trace_samples_per_point(stage2_args) -> int:
+    if stage2_args.shading_mode == "irgs_compat":
+        if stage2_args.use_irgs_mixture_sampling:
+            return max(stage2_args.diffuse_sample_num + stage2_args.light_sample_num, 1)
+        return max(stage2_args.diffuse_sample_num, 1)
+    return max(stage2_args.num_shading_samples, 1)
+
+
 
 def _set_requires_grad(group, value: bool):
     for param in group["params"]:
@@ -294,12 +310,16 @@ def save_stage2_trace_debug(output_root, iteration, view_name, gt_rgb, render_pk
     torchvision.utils.save_image(torch.clamp(render_pkg["normal"] * 0.5 + 0.5, 0.0, 1.0), os.path.join(iter_dir, f"{view_name}_normal.png"))
     torchvision.utils.save_image(depth_vis, os.path.join(iter_dir, f"{view_name}_depth.png"))
     torchvision.utils.save_image(depth_normal_vis, os.path.join(iter_dir, f"{view_name}_depth_normal.png"))
-    torchvision.utils.save_image(torch.clamp(aux["trace_selection"], 0.0, 1.0), os.path.join(iter_dir, f"{view_name}_trace_selection.png"))
-    torchvision.utils.save_image(torch.clamp(aux["trace_occlusion"], 0.0, 1.0), os.path.join(iter_dir, f"{view_name}_trace_occlusion.png"))
-    torchvision.utils.save_image(_tonemap_for_vis(aux["trace_direct"]), os.path.join(iter_dir, f"{view_name}_trace_direct.png"))
-    torchvision.utils.save_image(_tonemap_for_vis(aux["trace_indirect"]), os.path.join(iter_dir, f"{view_name}_trace_indirect.png"))
-    torchvision.utils.save_image(_tonemap_for_vis(aux["pbr_diffuse"]), os.path.join(iter_dir, f"{view_name}_pbr_diffuse.png"))
-    torchvision.utils.save_image(_tonemap_for_vis(aux["pbr_specular"]), os.path.join(iter_dir, f"{view_name}_pbr_specular.png"))
+    _save_image_if_present(aux["trace_selection"], os.path.join(iter_dir, f"{view_name}_trace_selection.png"))
+    _save_image_if_present(aux["trace_occlusion"], os.path.join(iter_dir, f"{view_name}_trace_occlusion.png"))
+    _save_image_if_present(aux["trace_direct"], os.path.join(iter_dir, f"{view_name}_trace_direct.png"), tonemap=True)
+    _save_image_if_present(aux["trace_indirect"], os.path.join(iter_dir, f"{view_name}_trace_indirect.png"), tonemap=True)
+    _save_image_if_present(aux["trace_alpha"], os.path.join(iter_dir, f"{view_name}_trace_alpha.png"))
+    _save_image_if_present(aux["trace_color_raw"], os.path.join(iter_dir, f"{view_name}_trace_color_raw.png"), tonemap=True)
+    _save_image_if_present(aux["pbr_diffuse"], os.path.join(iter_dir, f"{view_name}_pbr_diffuse.png"), tonemap=True)
+    _save_image_if_present(aux["pbr_specular"], os.path.join(iter_dir, f"{view_name}_pbr_specular.png"), tonemap=True)
+    _save_image_if_present(aux["irgs_diffuse"], os.path.join(iter_dir, f"{view_name}_irgs_diffuse.png"), tonemap=True)
+    _save_image_if_present(aux["irgs_specular"], os.path.join(iter_dir, f"{view_name}_irgs_specular.png"), tonemap=True)
     torchvision.utils.save_image(envmap.visualization(), os.path.join(iter_dir, "envmap.png"))
     torch.save(envmap.capture(), os.path.join(iter_dir, "envmap.pt"))
 
@@ -365,6 +385,8 @@ def training_stage2_trace(dataset, opt, pipe, stage2_args):
     ema_raster = 0.0
     ema_pbr = 0.0
     ema_lam = 0.0
+    ema_roughness_reg = 0.0
+    ema_metallic_reg = 0.0
     ema_d2n = 0.0
     ema_mask = 0.0
 
@@ -385,6 +407,16 @@ def training_stage2_trace(dataset, opt, pipe, stage2_args):
 
         render_pkg = render_multitarget(viewpoint_cam, gaussians, pipe, background)
         gt_rgb = viewpoint_cam.original_image.cuda()
+        lambda_roughness_reg = (
+            stage2_args.lambda_roughness_reg
+            if stage2_args.lambda_roughness_reg is not None
+            else stage2_args.lambda_lam
+        )
+        lambda_metallic_reg = (
+            stage2_args.lambda_metallic_reg
+            if stage2_args.lambda_metallic_reg is not None
+            else stage2_args.lambda_lam
+        )
 
         total_loss, loss_stats, aux = compute_stage2_trace_loss(
             render_pkg=render_pkg,
@@ -397,7 +429,8 @@ def training_stage2_trace(dataset, opt, pipe, stage2_args):
             normal_loss_start=stage2_args.normal_loss_start,
             lambda_raster=stage2_args.lambda_raster,
             lambda_dssim=opt.lambda_dssim,
-            lambda_lam=stage2_args.lambda_lam,
+            lambda_roughness_reg=lambda_roughness_reg,
+            lambda_metallic_reg=lambda_metallic_reg,
             lambda_d2n=stage2_args.lambda_d2n,
             lambda_mask=stage2_args.lambda_mask,
             lambda_base_color_smooth=stage2_args.lambda_base_color_smooth,
@@ -412,11 +445,17 @@ def training_stage2_trace(dataset, opt, pipe, stage2_args):
             max_trace_points=(
                 stage2_args.max_trace_points
                 if stage2_args.max_trace_points > 0
-                else max(stage2_args.trace_num_rays // max(stage2_args.num_shading_samples, 1), 1)
+                else max(stage2_args.trace_num_rays // _resolve_trace_samples_per_point(stage2_args), 1)
             ),
             trace_bias=stage2_args.trace_bias,
             randomized_samples=not stage2_args.disable_sample_jitter,
             collect_debug_maps=need_debug_maps,
+            shading_mode=stage2_args.shading_mode,
+            trace_feature_mode=stage2_args.trace_feature_mode,
+            use_irgs_mixture_sampling=stage2_args.use_irgs_mixture_sampling,
+            diffuse_sample_num=stage2_args.diffuse_sample_num,
+            light_sample_num=stage2_args.light_sample_num,
+            force_metallic_zero_in_irgs_mode=stage2_args.force_metallic_zero_in_irgs_mode,
         )
 
         total_loss.backward()
@@ -432,6 +471,8 @@ def training_stage2_trace(dataset, opt, pipe, stage2_args):
             ema_raster = 0.4 * loss_stats["loss_raster"].item() + 0.6 * ema_raster
             ema_pbr = 0.4 * loss_stats["loss_pbr"].item() + 0.6 * ema_pbr
             ema_lam = 0.4 * loss_stats["loss_lam"].item() + 0.6 * ema_lam
+            ema_roughness_reg = 0.4 * loss_stats["loss_roughness_reg"].item() + 0.6 * ema_roughness_reg
+            ema_metallic_reg = 0.4 * loss_stats["loss_metallic_reg"].item() + 0.6 * ema_metallic_reg
             ema_d2n = 0.4 * loss_stats["loss_d2n"].item() + 0.6 * ema_d2n
             ema_mask = 0.4 * loss_stats["loss_mask"].item() + 0.6 * ema_mask
 
@@ -456,10 +497,18 @@ def training_stage2_trace(dataset, opt, pipe, stage2_args):
                 tb_writer.add_scalar("train_stage2_trace/loss_raster", ema_raster, iteration)
                 tb_writer.add_scalar("train_stage2_trace/loss_pbr", ema_pbr, iteration)
                 tb_writer.add_scalar("train_stage2_trace/loss_lam", ema_lam, iteration)
+                tb_writer.add_scalar("train_stage2_trace/loss_roughness_reg", ema_roughness_reg, iteration)
+                tb_writer.add_scalar("train_stage2_trace/loss_metallic_reg", ema_metallic_reg, iteration)
                 tb_writer.add_scalar("train_stage2_trace/loss_d2n", ema_d2n, iteration)
                 tb_writer.add_scalar("train_stage2_trace/loss_mask", ema_mask, iteration)
                 tb_writer.add_scalar("train_stage2_trace/trace_points", loss_stats["trace_points"].item(), iteration)
                 tb_writer.add_scalar("train_stage2_trace/trace_valid_ratio", loss_stats["trace_valid_ratio"].item(), iteration)
+                tb_writer.add_scalar("train_stage2_trace/trace_alpha_mean", loss_stats["trace_alpha_mean"].item(), iteration)
+                tb_writer.add_scalar("train_stage2_trace/trace_color_mean", loss_stats["trace_color_mean"].item(), iteration)
+                tb_writer.add_scalar("train_stage2_trace/incident_direct_mean", loss_stats["incident_direct_mean"].item(), iteration)
+                tb_writer.add_scalar("train_stage2_trace/incident_indirect_mean", loss_stats["incident_indirect_mean"].item(), iteration)
+                tb_writer.add_scalar("train_stage2_trace/irgs_compat_diffuse_mean", loss_stats["irgs_compat_diffuse_mean"].item(), iteration)
+                tb_writer.add_scalar("train_stage2_trace/irgs_compat_specular_mean", loss_stats["irgs_compat_specular_mean"].item(), iteration)
 
             if need_debug_maps:
                 save_stage2_trace_debug(
@@ -536,6 +585,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--lambda_raster", type=float, default=1.0)
     parser.add_argument("--lambda_lam", type=float, default=0.001)
+    parser.add_argument("--lambda_roughness_reg", type=float, default=None)
+    parser.add_argument("--lambda_metallic_reg", type=float, default=None)
     parser.add_argument("--lambda_d2n", type=float, default=0.05)
     parser.add_argument("--normal_loss_start", type=int, default=1000)
     parser.add_argument("--lambda_mask", type=float, default=0.01)
@@ -557,20 +608,26 @@ if __name__ == "__main__":
     parser.add_argument("--roughness_lr", type=float, default=0.005)
     parser.add_argument("--metallic_lr", type=float, default=0.005)
     parser.add_argument("--envmap_lr", type=float, default=0.01)
-    parser.add_argument("--envmap_height", type=int, default=128)
-    parser.add_argument("--envmap_width", type=int, default=128)
+    parser.add_argument("--envmap_height", type=int, default=256)
+    parser.add_argument("--envmap_width", type=int, default=256)
     parser.add_argument("--envmap_init_value", type=float, default=1.5)
     parser.add_argument("--envmap_activation", type=str, default="exp", choices=["exp", "softplus", "none"])
-    parser.add_argument("--trace_backend", type=str, default="irgs_adapter", choices=["auto", "irgs", "irgs_adapter", "irgs_native", "open3d", "open3d_mesh"])
+    parser.add_argument("--trace_backend", type=str, default="irgs_adapter", choices=["auto", "irgs", "irgs_adapter", "irgs_adapter_compat", "irgs_native", "open3d", "open3d_mesh"])
     parser.add_argument("--trace_rebuild_every", type=int, default=0)
     parser.add_argument("--trace_voxel_size", type=float, default=0.004)
     parser.add_argument("--trace_sdf_trunc", type=float, default=0.02)
     parser.add_argument("--trace_depth_trunc", type=float, default=0.0)
     parser.add_argument("--disable_sample_jitter", action="store_true", default=False)
+    parser.add_argument("--shading_mode", type=str, default="comgs_pbr", choices=["comgs_pbr", "irgs_compat"])
+    parser.add_argument("--trace_feature_mode", type=str, default="comgs_pbr", choices=["comgs_pbr", "irgs_base_rough"])
+    parser.add_argument("--diffuse_sample_num", type=int, default=128)
+    parser.add_argument("--light_sample_num", type=int, default=0)
+    parser.add_argument("--use_irgs_mixture_sampling", action="store_true", default=False)
 
     _add_boolean_freeze_flags(parser, "freeze_geometry", default=True, help_text="Freeze geometry-related Gaussian parameters during stage2")
     _add_boolean_freeze_flags(parser, "freeze_color", default=False, help_text="Freeze SH color parameters during stage2")
     _add_boolean_freeze_flags(parser, "trace_mask_background", default=True, help_text="Mask object background while extracting the Open3D trace mesh")
+    _add_boolean_freeze_flags(parser, "force_metallic_zero_in_irgs_mode", default=True, help_text="Force metallic to zero in the IRGS-compatible shading path")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)

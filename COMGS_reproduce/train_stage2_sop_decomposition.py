@@ -66,19 +66,39 @@ def configure_stage2_gaussian_optimizer(gaussians: GaussianModel, args):
     color_names = {"f_dc", "f_rest"}
     material_names = {"albedo", "roughness", "metallic"}
 
+    feature_lr = getattr(args, "feature_lr", 0.0025)
+    material_lr = getattr(args, "material_lr", None)
+    albedo_lr = getattr(args, "albedo_lr", material_lr if material_lr is not None else feature_lr)
+    roughness_lr = getattr(args, "roughness_lr", material_lr if material_lr is not None else feature_lr)
+    metallic_lr = getattr(args, "metallic_lr", material_lr if material_lr is not None else feature_lr)
+    default_group_lrs = {
+        "f_dc": feature_lr,
+        "f_rest": feature_lr / 20.0,
+        "opacity": args.opacity_lr,
+        "scaling": args.scaling_lr,
+        "rotation": args.rotation_lr,
+        "albedo": albedo_lr,
+        "roughness": roughness_lr,
+        "metallic": metallic_lr,
+    }
+
     for group in gaussians.optimizer.param_groups:
         name = group["name"]
         if name in geometry_names:
             _set_requires_grad(group, not args.freeze_geometry)
             if args.freeze_geometry:
                 group["lr"] = 0.0
+            elif name != "xyz":
+                group["lr"] = default_group_lrs[name]
         elif name in color_names:
             _set_requires_grad(group, not args.freeze_color)
             if args.freeze_color:
                 group["lr"] = 0.0
+            else:
+                group["lr"] = default_group_lrs[name]
         elif name in material_names:
             _set_requires_grad(group, True)
-            group["lr"] = args.material_lr
+            group["lr"] = default_group_lrs[name]
 
 
 class Stage2SOPState(nn.Module):
@@ -883,8 +903,11 @@ def _build_parser() -> ArgumentParser:
 
     parser.add_argument("--save_debug_every", type=int, default=500)
     parser.add_argument("--summary_every", type=int, default=500)
-    parser.add_argument("--material_lr", type=float, default=0.01)
-    parser.add_argument("--envmap_lr", type=float, default=0.1)
+    parser.add_argument("--material_lr", type=float, default=None)
+    parser.add_argument("--albedo_lr", type=float, default=0.0075)
+    parser.add_argument("--roughness_lr", type=float, default=0.005)
+    parser.add_argument("--metallic_lr", type=float, default=0.005)
+    parser.add_argument("--envmap_lr", type=float, default=0.01)
     parser.add_argument("--sop_texture_lr", type=float, default=0.001)
     parser.add_argument("--envmap_height", type=int, default=256)
     parser.add_argument("--envmap_width", type=int, default=256)

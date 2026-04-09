@@ -98,6 +98,18 @@ def _compute_metrics(image_pairs, gt_background: str):
     return summary, per_view
 
 
+def _filter_pairs(image_pairs, frame_start=None, frame_end=None, max_frames=None):
+    total = len(image_pairs)
+    start = 0 if frame_start is None else max(0, frame_start)
+    end = total if frame_end is None else min(total, frame_end)
+    if end < start:
+        end = start
+    filtered = image_pairs[start:end]
+    if max_frames is not None:
+        filtered = filtered[: max(0, max_frames)]
+    return filtered, total
+
+
 def _collect_legacy_targets(scene_dir: Path):
     targets = []
     for split_name in SPLIT_NAMES:
@@ -267,7 +279,15 @@ def _write_results(scene_dir: Path, full_results, per_view_results):
         json.dump(per_view_results, fp, indent=True)
 
 
-def evaluate(model_paths, render_suffix: str, source_path=None, gt_background: str = "auto"):
+def evaluate(
+    model_paths,
+    render_suffix: str,
+    source_path=None,
+    gt_background: str = "auto",
+    frame_start=None,
+    frame_end=None,
+    max_frames=None,
+):
     for scene_dir_str in model_paths:
         scene_dir = Path(scene_dir_str)
         try:
@@ -284,10 +304,26 @@ def evaluate(model_paths, render_suffix: str, source_path=None, gt_background: s
                 for target in legacy_targets:
                     split_name = target["split"]
                     method = target["method"]
+                    filtered_pairs, total_pairs = _filter_pairs(
+                        target["pairs"],
+                        frame_start=frame_start,
+                        frame_end=frame_end,
+                        max_frames=max_frames,
+                    )
+                    if not filtered_pairs:
+                        print(
+                            f"  Skip {split_name}/{method}: no frames left after filtering "
+                            f"(total={total_pairs}, start={frame_start}, end={frame_end}, max={max_frames})"
+                        )
+                        continue
                     if use_split_layout:
                         print("Split:", split_name)
                     print("Method:", method)
-                    summary, per_view = _compute_metrics(target["pairs"], gt_background=effective_background)
+                    print(
+                        f"  Using {len(filtered_pairs)}/{total_pairs} frame(s) "
+                        f"(start={frame_start}, end={frame_end}, max={max_frames})"
+                    )
+                    summary, per_view = _compute_metrics(filtered_pairs, gt_background=effective_background)
                     if use_split_layout:
                         full_results.setdefault(split_name, {})[method] = summary
                         per_view_results.setdefault(split_name, {})[method] = per_view
@@ -316,9 +352,25 @@ def evaluate(model_paths, render_suffix: str, source_path=None, gt_background: s
             for target in stage2_targets:
                 split_name = target["split"]
                 method = target["method"]
+                filtered_pairs, total_pairs = _filter_pairs(
+                    target["pairs"],
+                    frame_start=frame_start,
+                    frame_end=frame_end,
+                    max_frames=max_frames,
+                )
+                if not filtered_pairs:
+                    print(
+                        f"  Skip {split_name}/{method}: no frames left after filtering "
+                        f"(total={total_pairs}, start={frame_start}, end={frame_end}, max={max_frames})"
+                    )
+                    continue
                 print("Split:", split_name)
                 print("Method:", method)
-                summary, per_view = _compute_metrics(target["pairs"], gt_background=effective_background)
+                print(
+                    f"  Using {len(filtered_pairs)}/{total_pairs} frame(s) "
+                    f"(start={frame_start}, end={frame_end}, max={max_frames})"
+                )
+                summary, per_view = _compute_metrics(filtered_pairs, gt_background=effective_background)
                 full_results.setdefault(split_name, {})[method] = summary
                 per_view_results.setdefault(split_name, {})[method] = per_view
 
@@ -353,6 +405,24 @@ if __name__ == "__main__":
         choices=["auto", "none", "white", "black"],
         help="How to composite GT images with alpha before comparison.",
     )
+    parser.add_argument(
+        "--frame_start",
+        type=int,
+        default=None,
+        help="Optional start index (inclusive) after sorting frames by filename.",
+    )
+    parser.add_argument(
+        "--frame_end",
+        type=int,
+        default=None,
+        help="Optional end index (exclusive) after sorting frames by filename.",
+    )
+    parser.add_argument(
+        "--max_frames",
+        type=int,
+        default=None,
+        help="Optional cap on number of frames after applying frame_start/frame_end.",
+    )
     args = parser.parse_args()
 
     evaluate(
@@ -360,4 +430,7 @@ if __name__ == "__main__":
         render_suffix=args.render_suffix,
         source_path=args.source_path,
         gt_background=args.gt_background,
+        frame_start=args.frame_start,
+        frame_end=args.frame_end,
+        max_frames=args.max_frames,
     )

@@ -16,6 +16,53 @@ def _flip_align_view(normal: torch.Tensor, viewdir: torch.Tensor) -> torch.Tenso
     return normal * torch.where(dotprod >= 0, 1, -1)
 
 
+def _build_trace_features(gaussians, feature_mode: str = "comgs_pbr") -> torch.Tensor:
+    if feature_mode == "comgs_pbr":
+        return torch.cat(
+            [
+                gaussians.get_albedo,
+                gaussians.get_roughness,
+                gaussians.get_metallic,
+            ],
+            dim=1,
+        )
+    if feature_mode == "irgs_base_rough":
+        return torch.cat(
+            [
+                gaussians.get_albedo,
+                gaussians.get_roughness,
+            ],
+            dim=1,
+        )
+    raise ValueError(f"Unsupported trace feature mode: {feature_mode}")
+
+
+def _split_trace_feature_outputs(
+    feature_tensor: torch.Tensor,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+):
+    if feature_tensor.shape[-1] < 4:
+        raise ValueError(
+            "Trace feature tensor must contain at least 4 channels "
+            f"(got shape={tuple(feature_tensor.shape)})."
+        )
+
+    out_device = device if device is not None else feature_tensor.device
+    out_dtype = dtype if dtype is not None else feature_tensor.dtype
+    albedo = feature_tensor[..., :3]
+    roughness = feature_tensor[..., 3:4]
+    if feature_tensor.shape[-1] >= 5:
+        metallic = feature_tensor[..., 4:5]
+    else:
+        metallic = torch.zeros(
+            (*feature_tensor.shape[:-1], 1),
+            device=out_device,
+            dtype=out_dtype,
+        )
+    return albedo, roughness, metallic
+
+
 class IRGS2DGaussianTraceAdapter:
     """
     Thin adapter around the IRGS-style 2D Gaussian ray tracing backend.
@@ -66,6 +113,7 @@ class IRGS2DGaussianTraceAdapter:
         ray_origins: torch.Tensor,
         ray_directions: torch.Tensor,
         features: Optional[torch.Tensor] = None,
+        feature_mode: str = "comgs_pbr",
         camera_center: Optional[torch.Tensor] = None,
         back_culling: bool = False,
     ) -> Dict[str, torch.Tensor]:
@@ -89,14 +137,7 @@ class IRGS2DGaussianTraceAdapter:
         normals = _safe_normalize(normals_raw)
 
         if features is None:
-            features = torch.cat(
-                [
-                    self.gaussians.get_albedo,
-                    self.gaussians.get_roughness,
-                    self.gaussians.get_metallic,
-                ],
-                dim=1,
-            )
+            features = _build_trace_features(self.gaussians, feature_mode=feature_mode)
 
         shs = self.gaussians.get_features
         color, normal, feature, depth, alpha = self.gaussian_tracer.trace(
@@ -124,6 +165,11 @@ class IRGS2DGaussianTraceAdapter:
 
         positions = rays_o + depth.unsqueeze(-1) * rays_d
         hit_mask = alpha > 1e-4
+        albedo, roughness, metallic = _split_trace_feature_outputs(
+            feature,
+            device=feature.device,
+            dtype=feature.dtype,
+        )
 
         outputs = {
             "color": color.view(*prefix, 3),
@@ -133,8 +179,8 @@ class IRGS2DGaussianTraceAdapter:
             "alpha": alpha.view(*prefix),
             "position": positions.view(*prefix, 3),
             "hit_mask": hit_mask.view(*prefix),
-            "albedo": torch.clamp(feature[:, :3], 0.0, 1.0).view(*prefix, 3),
-            "roughness": torch.clamp(feature[:, 3:4], 0.0, 1.0).view(*prefix, 1),
-            "metallic": torch.clamp(feature[:, 4:5], 0.0, 1.0).view(*prefix, 1),
+            "albedo": torch.clamp(albedo, 0.0, 1.0).view(*prefix, 3),
+            "roughness": torch.clamp(roughness, 0.0, 1.0).view(*prefix, 1),
+            "metallic": torch.clamp(metallic, 0.0, 1.0).view(*prefix, 1),
         }
         return outputs

@@ -39,9 +39,20 @@ class ParamGroup:
 
     def extract(self, args):
         group = GroupParams()
+        extracted_keys = set()
         for arg in vars(args).items():
             if arg[0] in vars(self) or ("_" + arg[0]) in vars(self):
                 setattr(group, arg[0], arg[1])
+                extracted_keys.add(arg[0])
+
+        # When cfg_args is missing (or a field is omitted there), argparse can
+        # leave the merged namespace without these attributes. Fall back to the
+        # ParamGroup defaults defined on `self` so downstream code can rely on
+        # a complete parameter set.
+        for key, value in vars(self).items():
+            normalized_key = key[1:] if key.startswith("_") else key
+            if normalized_key not in extracted_keys and not hasattr(group, normalized_key):
+                setattr(group, normalized_key, value)
         return group
 
 class ModelParams(ParamGroup): 
@@ -105,8 +116,8 @@ def get_combined_args(parser : ArgumentParser):
         with open(cfgfilepath) as cfg_file:
             print("Config file found: {}".format(cfgfilepath))
             cfgfile_string = cfg_file.read()
-    except TypeError:
-        print("Config file not found at")
+    except (TypeError, FileNotFoundError):
+        print("Config file not found, using command line arguments only.")
         pass
     args_cfgfile = eval(cfgfile_string)
 

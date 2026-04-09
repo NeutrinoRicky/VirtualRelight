@@ -19,6 +19,14 @@ from utils.deferred_pbr_comgs import (
     sample_hemisphere_hammersley,
 )
 from utils.general_utils import safe_state
+from utils.irgs_compat_sampling import (
+    sample_incident_dirs_diffuse_irgs_compat,
+    sample_incident_dirs_mixture_irgs_compat,
+)
+from utils.irgs_compat_shading import (
+    compose_incident_lights_irgs_compat,
+    integrate_incident_radiance_irgs_compat,
+)
 from utils.tracing_comgs import TraceBackendConfig, build_trace_backend
 
 
@@ -49,6 +57,12 @@ def _normalize_single_channel_for_vis(x, valid_mask=None, eps=1e-6):
 def _tonemap_for_vis(x):
     y = torch.nan_to_num(x.detach(), nan=0.0, posinf=0.0, neginf=0.0)
     return torch.clamp(y / (1.0 + y), 0.0, 1.0)
+
+
+def _add_boolean_flag(parser: ArgumentParser, name: str, default: bool, help_text: str):
+    parser.add_argument(f"--{name}", dest=name, action="store_true", help=help_text)
+    parser.add_argument(f"--no_{name}", dest=name, action="store_false", help=f"Disable {help_text}")
+    parser.set_defaults(**{name: default})
 
 
 
@@ -99,6 +113,12 @@ def _build_export_masks(viewpoint_cam, render_pkg, valid_mask: torch.Tensor, exp
 
 def _composite_on_white(x: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
     return torch.clamp(x * alpha + (1.0 - alpha), 0.0, 1.0)
+
+
+def _save_image_if_present(image: torch.Tensor, path: str):
+    if image is None:
+        return
+    torchvision.utils.save_image(torch.clamp(image, 0.0, 1.0), path)
 
 
 
@@ -217,6 +237,150 @@ def render_stage2_trace_view(
 
 
 @torch.no_grad()
+def render_stage2_trace_view_irgs_compat(
+    viewpoint_cam,
+    gaussians,
+    pipe,
+    background,
+    envmap,
+    trace_backend,
+    secondary_num_samples: int,
+    trace_bias: float,
+    trace_chunk_size: int,
+    export_mask_mode: str,
+    randomized_samples: bool = False,
+    weight_threshold: float = 1e-4,
+    trace_feature_mode: str = "irgs_base_rough",
+    use_irgs_mixture_sampling: bool = False,
+    diffuse_sample_num: int = 128,
+    light_sample_num: int = 0,
+    force_metallic_zero_in_irgs_mode: bool = True,
+):
+    del secondary_num_samples
+    render_pkg = render_multitarget(viewpoint_cam, gaussians, pipe, background)
+    points, valid_mask = recover_shading_points(
+        view=viewpoint_cam,
+        depth_unbiased=render_pkg["depth_unbiased"],
+        weight=render_pkg["weight"],
+        weight_threshold=weight_threshold,
+    )
+
+    height, width = valid_mask.shape
+    flat_valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).squeeze(1)
+
+    pbr_flat = render_pkg["render"].permute(1, 2, 0).reshape(-1, 3).clone()
+    direct_flat = pbr_flat.new_zeros((height * width, 3))
+    indirect_flat = pbr_flat.new_zeros((height * width, 3))
+    occlusion_flat = pbr_flat.new_zeros((height * width, 1))
+    alpha_flat = pbr_flat.new_zeros((height * width, 1))
+    trace_color_raw_flat = pbr_flat.new_zeros((height * width, 3))
+    irgs_diffuse_flat = pbr_flat.new_zeros((height * width, 3))
+    irgs_specular_flat = pbr_flat.new_zeros((height * width, 3))
+
+    flat_points = points.reshape(-1, 3)
+    flat_normals = F.normalize(render_pkg["normal"].permute(1, 2, 0).reshape(-1, 3), dim=-1, eps=1e-6)
+    flat_albedo = render_pkg["albedo"].permute(1, 2, 0).reshape(-1, 3)
+    flat_roughness = render_pkg["roughness"].permute(1, 2, 0).reshape(-1, 1)
+    flat_alpha = render_pkg["weight"].permute(1, 2, 0).reshape(-1, 1).clamp(0.0, 1.0)
+    background_rgb = background.to(device=pbr_flat.device, dtype=pbr_flat.dtype).view(1, 3)
+
+    for chunk_idx in torch.split(flat_valid_idx, trace_chunk_size):
+        pts = flat_points[chunk_idx]
+        nrm = flat_normals[chunk_idx]
+        base_color = flat_albedo[chunk_idx]
+        roughness = flat_roughness[chunk_idx]
+        if force_metallic_zero_in_irgs_mode:
+            _metallic_vis = torch.zeros_like(render_pkg["metallic"].permute(1, 2, 0).reshape(-1, 1)[chunk_idx])
+        else:
+            _metallic_vis = render_pkg["metallic"].permute(1, 2, 0).reshape(-1, 1)[chunk_idx]
+        del _metallic_vis
+        viewdirs = compute_view_directions(pts, viewpoint_cam.camera_center)
+
+        if use_irgs_mixture_sampling:
+            sampling = sample_incident_dirs_mixture_irgs_compat(
+                normals=nrm,
+                envmap=envmap,
+                diffuse_sample_num=diffuse_sample_num,
+                light_sample_num=light_sample_num,
+                randomized=randomized_samples,
+            )
+        else:
+            if diffuse_sample_num <= 0:
+                raise ValueError("IRGS-compatible render path requires diffuse_sample_num > 0 when mixture sampling is disabled.")
+            sampling = sample_incident_dirs_diffuse_irgs_compat(
+                normals=nrm,
+                sample_num=diffuse_sample_num,
+                randomized=randomized_samples,
+            )
+
+        incident_dirs = sampling["incident_dirs"]
+        ray_origins = pts[:, None, :] + incident_dirs * trace_bias
+        trace_outputs = trace_backend.trace(
+            ray_origins=ray_origins,
+            ray_directions=incident_dirs,
+            envmap=envmap,
+            secondary_num_samples=0,
+            randomized_secondary=randomized_samples,
+            camera_center=viewpoint_cam.camera_center,
+            trace_feature_mode=trace_feature_mode,
+        )
+        if "trace_color" not in trace_outputs or "trace_alpha" not in trace_outputs:
+            raise RuntimeError(
+                "IRGS-compatible render path requires a backend that exposes trace_color and trace_alpha. "
+                "Use --trace_backend irgs_adapter_compat."
+            )
+
+        direct_radiance = envmap(incident_dirs)
+        trace_alpha = trace_outputs["trace_alpha"].clamp(0.0, 1.0)
+        trace_color = trace_outputs["trace_color"]
+        incident_radiance = compose_incident_lights_irgs_compat(
+            trace_alpha=trace_alpha,
+            trace_color=trace_color,
+            direct_env_radiance=direct_radiance,
+        )
+        pbr_linear, pbr_aux = integrate_incident_radiance_irgs_compat(
+            base_color=base_color,
+            roughness=roughness,
+            normals=nrm,
+            viewdirs=viewdirs,
+            lightdirs=incident_dirs,
+            incident_radiance=incident_radiance,
+            incident_weights_or_areas=sampling["sample_weight"],
+        )
+        pbr_rgb = rgb_to_srgb(pbr_linear)
+        ray_alpha = flat_alpha[chunk_idx]
+        ray_rgb = pbr_rgb * ray_alpha + background_rgb * (1.0 - ray_alpha)
+
+        pbr_flat[chunk_idx] = ray_rgb
+        direct_flat[chunk_idx] = direct_radiance.mean(dim=1)
+        indirect_flat[chunk_idx] = trace_color.mean(dim=1)
+        occlusion_flat[chunk_idx] = trace_alpha.mean(dim=1)
+        alpha_flat[chunk_idx] = trace_alpha.mean(dim=1)
+        trace_color_raw_flat[chunk_idx] = trace_color.mean(dim=1)
+        irgs_diffuse_flat[chunk_idx] = pbr_aux["diffuse"]
+        irgs_specular_flat[chunk_idx] = pbr_aux["specular"]
+
+    pbr_render_raw = pbr_flat.reshape(height, width, 3).permute(2, 0, 1)
+    masks = _build_export_masks(viewpoint_cam, render_pkg, valid_mask, export_mask_mode)
+    pbr_render_masked = pbr_render_raw * masks["export_alpha"]
+
+    return {
+        "pbr_render": pbr_render_masked,
+        "pbr_render_raw": pbr_render_raw,
+        "trace_direct": direct_flat.reshape(height, width, 3).permute(2, 0, 1),
+        "trace_indirect": indirect_flat.reshape(height, width, 3).permute(2, 0, 1),
+        "trace_occlusion": occlusion_flat.reshape(height, width, 1).permute(2, 0, 1),
+        "trace_alpha": alpha_flat.reshape(height, width, 1).permute(2, 0, 1),
+        "trace_color_raw": trace_color_raw_flat.reshape(height, width, 3).permute(2, 0, 1),
+        "irgs_diffuse": irgs_diffuse_flat.reshape(height, width, 3).permute(2, 0, 1),
+        "irgs_specular": irgs_specular_flat.reshape(height, width, 3).permute(2, 0, 1),
+        "valid_mask": valid_mask.unsqueeze(0),
+        "masks": masks,
+        "render_pkg": render_pkg,
+    }
+
+
+@torch.no_grad()
 def save_stage2_trace_outputs(output_dir: str, view_name: str, stage2_view_pkg: dict):
     os.makedirs(output_dir, exist_ok=True)
     render_pkg = stage2_view_pkg["render_pkg"]
@@ -245,6 +409,18 @@ def save_stage2_trace_outputs(output_dir: str, view_name: str, stage2_view_pkg: 
     trace_direct = _composite_on_white(_tonemap_for_vis(stage2_view_pkg["trace_direct"]), export_alpha)
     trace_indirect = _composite_on_white(_tonemap_for_vis(stage2_view_pkg["trace_indirect"]), export_alpha)
     trace_occlusion = _composite_on_white(torch.clamp(stage2_view_pkg["trace_occlusion"], 0.0, 1.0), export_alpha)
+    trace_alpha = stage2_view_pkg.get("trace_alpha")
+    trace_color_raw = stage2_view_pkg.get("trace_color_raw")
+    irgs_diffuse = stage2_view_pkg.get("irgs_diffuse")
+    irgs_specular = stage2_view_pkg.get("irgs_specular")
+    if trace_alpha is not None:
+        trace_alpha = _composite_on_white(torch.clamp(trace_alpha, 0.0, 1.0), export_alpha)
+    if trace_color_raw is not None:
+        trace_color_raw = _composite_on_white(_tonemap_for_vis(trace_color_raw), export_alpha)
+    if irgs_diffuse is not None:
+        irgs_diffuse = _composite_on_white(_tonemap_for_vis(irgs_diffuse), export_alpha)
+    if irgs_specular is not None:
+        irgs_specular = _composite_on_white(_tonemap_for_vis(irgs_specular), export_alpha)
 
     torchvision.utils.save_image(rgb_masked, os.path.join(output_dir, f"{view_name}_rgb.png"))
     torchvision.utils.save_image(rgb_raw, os.path.join(output_dir, f"{view_name}_rgb_raw.png"))
@@ -270,6 +446,10 @@ def save_stage2_trace_outputs(output_dir: str, view_name: str, stage2_view_pkg: 
     torchvision.utils.save_image(trace_direct, os.path.join(output_dir, f"{view_name}_trace_direct.png"))
     torchvision.utils.save_image(trace_indirect, os.path.join(output_dir, f"{view_name}_trace_indirect.png"))
     torchvision.utils.save_image(trace_occlusion, os.path.join(output_dir, f"{view_name}_trace_occlusion.png"))
+    _save_image_if_present(trace_alpha, os.path.join(output_dir, f"{view_name}_trace_alpha.png"))
+    _save_image_if_present(trace_color_raw, os.path.join(output_dir, f"{view_name}_trace_color_raw.png"))
+    _save_image_if_present(irgs_diffuse, os.path.join(output_dir, f"{view_name}_irgs_diffuse.png"))
+    _save_image_if_present(irgs_specular, os.path.join(output_dir, f"{view_name}_irgs_specular.png"))
 
 
 def _build_unique_view_name(viewpoint_cam):
@@ -292,7 +472,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--split", type=str, default="train", choices=["train", "test", "both"])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--trace_backend", type=str, default="irgs_adapter", choices=["auto", "irgs", "irgs_adapter", "irgs_native", "open3d", "open3d_mesh"])
+    parser.add_argument("--trace_backend", type=str, default="irgs_adapter", choices=["auto", "irgs", "irgs_adapter", "irgs_adapter_compat", "irgs_native", "open3d", "open3d_mesh"])
     parser.add_argument("--num_shading_samples", type=int, default=256)
     parser.add_argument("--secondary_num_samples", type=int, default=16)
     parser.add_argument("--trace_bias", type=float, default=0.05)
@@ -303,6 +483,12 @@ if __name__ == "__main__":
     parser.add_argument("--trace_mask_background", action="store_true", default=True)
     parser.add_argument("--disable_sample_jitter", action="store_true", default=True)
     parser.add_argument("--export_mask_mode", type=str, default="render", choices=["render", "gt", "intersect"])
+    parser.add_argument("--shading_mode", type=str, default="comgs_pbr", choices=["comgs_pbr", "irgs_compat"])
+    parser.add_argument("--trace_feature_mode", type=str, default="comgs_pbr", choices=["comgs_pbr", "irgs_base_rough"])
+    parser.add_argument("--diffuse_sample_num", type=int, default=128)
+    parser.add_argument("--light_sample_num", type=int, default=0)
+    parser.add_argument("--use_irgs_mixture_sampling", action="store_true", default=False)
+    _add_boolean_flag(parser, "force_metallic_zero_in_irgs_mode", default=True, help_text="Force metallic to zero in the IRGS-compatible shading path")
     args = get_combined_args(parser)
 
     safe_state(args.quiet)
@@ -352,20 +538,40 @@ if __name__ == "__main__":
         torch.save(envmap.capture(), os.path.join(output_dir, "envmap.pt"))
 
         for viewpoint_cam in tqdm(cameras, desc=f"Rendering {split_name} views"):
-            stage2_view_pkg = render_stage2_trace_view(
-                viewpoint_cam=viewpoint_cam,
-                gaussians=gaussians,
-                pipe=pipe,
-                background=background,
-                envmap=envmap,
-                trace_backend=trace_backend,
-                num_shading_samples=args.num_shading_samples,
-                secondary_num_samples=args.secondary_num_samples,
-                trace_bias=args.trace_bias,
-                trace_chunk_size=args.trace_chunk_size,
-                export_mask_mode=args.export_mask_mode,
-                randomized_samples=not args.disable_sample_jitter,
-            )
+            if args.shading_mode == "irgs_compat":
+                stage2_view_pkg = render_stage2_trace_view_irgs_compat(
+                    viewpoint_cam=viewpoint_cam,
+                    gaussians=gaussians,
+                    pipe=pipe,
+                    background=background,
+                    envmap=envmap,
+                    trace_backend=trace_backend,
+                    secondary_num_samples=args.secondary_num_samples,
+                    trace_bias=args.trace_bias,
+                    trace_chunk_size=args.trace_chunk_size,
+                    export_mask_mode=args.export_mask_mode,
+                    randomized_samples=not args.disable_sample_jitter,
+                    trace_feature_mode=args.trace_feature_mode,
+                    use_irgs_mixture_sampling=args.use_irgs_mixture_sampling,
+                    diffuse_sample_num=args.diffuse_sample_num,
+                    light_sample_num=args.light_sample_num,
+                    force_metallic_zero_in_irgs_mode=args.force_metallic_zero_in_irgs_mode,
+                )
+            else:
+                stage2_view_pkg = render_stage2_trace_view(
+                    viewpoint_cam=viewpoint_cam,
+                    gaussians=gaussians,
+                    pipe=pipe,
+                    background=background,
+                    envmap=envmap,
+                    trace_backend=trace_backend,
+                    num_shading_samples=args.num_shading_samples,
+                    secondary_num_samples=args.secondary_num_samples,
+                    trace_bias=args.trace_bias,
+                    trace_chunk_size=args.trace_chunk_size,
+                    export_mask_mode=args.export_mask_mode,
+                    randomized_samples=not args.disable_sample_jitter,
+                )
             unique_view_name = _build_unique_view_name(viewpoint_cam)
             save_stage2_trace_outputs(output_dir, unique_view_name, stage2_view_pkg)
 

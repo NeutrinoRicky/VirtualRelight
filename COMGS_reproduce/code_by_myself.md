@@ -114,7 +114,7 @@ CUDA_VISIBLE_DEVICES=1 python SOP/phase1_initializer.py \
 
 CUDA_VISIBLE_DEVICES=0 python SOP/phase1_initializer.py \
   -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/lego \
-  -m ./output/TensorIR/lego \
+  -m ./output/TensorIR/lego/stage2/trace \
   --checkpoint ./output/TensorIR/lego/chkpnt_best.pth \
   --object_filter_mode weight_and_mask \
   --mask_erosion_radius 8 \
@@ -227,7 +227,42 @@ CUDA_VISIBLE_DEVICES=0 python render_stage2_sop_importance_sample_object_comgs.p
   CUDA_VISIBLE_DEVICES=0 python metrics.py -m /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_reproduce/output/TensorIR/lego/stage2_sop_render
 
 
-### 第二阶段光追，尝试采用RefGS的初始化几何结果
+### Hotdog
+CUDA_VISIBLE_DEVICES=1 python train_stage2_trace_comgs.py \
+  -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/hotdog \
+  -m ./output/TensorIR/hotdog/stage2/trace \
+  --stage1_ckpt /mnt/store/fd/project/StaticReconstruction/IRGS/outputs/TensoIR_Synthetic/hotdog/refgs/chkpnt50000.pth \
+  --stage1_ckpt_format irgs_refgs \
+  --trace_backend irgs_adapter \
+  --freeze_geometry \
+  --no_freeze_color \
+  --num_shading_samples 256 \
+  --trace_num_rays 262144 \
+  --trace_bias 0.05 \
+  --envmap_lr 0.01 \
+  --envmap_height 128 \
+  --envmap_width 128 \
+  --envmap_init_value 1.5 \
+  --lambda_mask 0.01 \
+  --lambda_base_color_smooth 2.0 \
+  --lambda_roughness_smooth 0.1 \
+  --lambda_normal_smooth 0.01 \
+  --lambda_light 0.5 \
+  --lambda_light_smooth 0.05 \
+  --save_debug_every 500 \
+  --iterations 5000
+
+CUDA_VISIBLE_DEVICES=1 python render_stage2_trace_comgs.py \
+  -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/hotdog \
+  -m ./output/TensorIR/hotdog/stage2/trace \
+  --checkpoint ./output/TensorIR/hotdog/stage2/trace/object_step2_trace.ckpt \
+  --split test \
+  --eval \
+  --export_mask_mode render 
+
+CUDA_VISIBLE_DEVICES=1 python metrics.py -m /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_reproduce/output/TensorIR/hotdog/stage2/trace/stage2_trace_render --render_suffix _rgb_raw.png
+
+### Lego: 第二阶段光追，尝试采用RefGS的初始化几何结果
 输出为./output/TensorIR/stage2/lego_from_refgs
 环境光照可能有问题，要重新train一下
 TODO：注意 采样从原来的 Hammersley 改成了 IRGS 的 Fibonacci hemisphere sampling，需要修改回来 metallic的初始化也有问题，需要修改
@@ -237,9 +272,9 @@ render_multitarget 的 normal map 也补成了 rend_normal / alpha 后再 normal
 默认 lambda_lam 现在是 0.0，不再额外带一个 IRGS 没有的材质先验，train_stage2_trace_comgs.py (line 537)。
 
 
-CUDA_VISIBLE_DEVICES=1 python /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_reproduce/train_stage2_trace_comgs.py \
+CUDA_VISIBLE_DEVICES=1 python train_stage2_trace_comgs.py \
   -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/lego \
-  -m /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_reproduce/output/TensorIR/lego \
+  -m ./output/TensorIR/lego/stage2/trace \
   --stage1_ckpt /mnt/store/fd/project/StaticReconstruction/IRGS/outputs/TensoIR_Synthetic/lego/refgs/chkpnt50000.pth \
   --stage1_ckpt_format irgs_refgs \
   --trace_backend irgs_adapter \
@@ -261,21 +296,69 @@ CUDA_VISIBLE_DEVICES=1 python /mnt/store/fd/project/StaticReconstruction/Virtual
   --save_debug_every 500 \
   --iterations 5000
 
-
-SOP 训练 训练效率是上来了,但albedo还是过高,可能环境光的学习率得改
-CUDA_VISIBLE_DEVICES=3 python train_stage2_sop_decomposition.py \
+CUDA_VISIBLE_DEVICES=3 python train_stage2_trace_comgs.py \
   -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/lego \
-  -m ./output/TensorIR/lego \
+  -m ./output/TensorIR/lego/stage2/trace \
+  --stage1_ckpt /mnt/store/fd/project/StaticReconstruction/IRGS/outputs/TensoIR_Synthetic/lego/refgs/chkpnt50000.pth \
+  --trace_backend irgs_adapter_compat \
+  --shading_mode irgs_compat \
+  --trace_feature_mode irgs_base_rough \
+  --diffuse_sample_num 128 \
+  --iterations 20000
+
+
+CUDA_VISIBLE_DEVICES=1 python render_stage2_trace_comgs.py \
+  -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/lego \
+  -m ./output/TensorIR/lego/stage2/trace \
+  --checkpoint ./output/TensorIR/lego/stage2/trace/object_step2_trace.ckpt \
+  --split test \
+  --eval \
+  --export_mask_mode render \
+
+CUDA_VISIBLE_DEVICES=1 python metrics.py -m /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_reproduce/output/TensorIR/lego/stage2/trace/stage2_trace_render --render_suffix _rgb_raw.png --max_frames 10
+SOP 训练 训练效率是上来了,但albedo还是过高,可能环境光的学习率得改
+先初始化SOP，再初始化探针材质
+CUDA_VISIBLE_DEVICES=1 python SOP/phase1_initializer.py \
+  -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/lego \
+  -m ./output/TensorIR/lego/stage2/sop \
+  --checkpoint /mnt/store/fd/project/StaticReconstruction/IRGS/outputs/TensoIR_Synthetic/lego/refgs/chkpnt50000.pth \
+  --checkpoint_format irgs_refgs \
+  --output_dir ./output/TensorIR/lego/stage2/sop \
+  --object_filter_mode weight_and_mask \
+  --mask_erosion_radius 8 \
+  --fusion_voxel_factor 0.00025 \
+  --probe_source mesh_largest \
+  --target_num_probes 5000 \
+  --mesh_surface_sample_count 25000
+
+CUDA_VISIBLE_DEVICES=1 python SOP/init_sop_query_textures.py \
+  -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/lego \
+  -m ./output/TensorIR/lego/stage2/sop \
+  --checkpoint /mnt/store/fd/project/StaticReconstruction/IRGS/outputs/TensoIR_Synthetic/lego/refgs/chkpnt50000.pth \
+  --checkpoint_format irgs_refgs \
+  --probe_file ./output/TensorIR/lego/stage2/sop/probe_offset_points.ply \
+  --output_dir ./output/TensorIR/lego/stage2/sop \
+  --trace_backend auto \
+  --tex_h 16 \
+  --tex_w 16
+
+CUDA_VISIBLE_DEVICES=2 python train_stage2_sop_decomposition.py \
+  -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/lego \
+  -m ./output/TensorIR/lego/stage2/sop \
   --stage1_ckpt /mnt/store/fd/project/StaticReconstruction/IRGS/outputs/TensoIR_Synthetic/lego/refgs/chkpnt50000.pth \
   --stage1_ckpt_format irgs_refgs \
-  --sop_init ./output/TensorIR/lego/SOP_query_init/sop_query_init.pt \
-  --iterations 10000
+  --sop_init ./output/TensorIR/lego/stage2/sop/sop_query_init.pt \
+  --iterations 10000 \
+  --trace_backend irgs_adapter \
+  --freeze_geometry \
+  --no_freeze_color \
+  --sop_query_topk 5
 
 SOP render：G-buffer时间压缩, SOP knn缓存
-CUDA_VISIBLE_DEVICES=3 python render_stage2_sop_comgs.py \
+CUDA_VISIBLE_DEVICES=1 python render_stage2_sop_comgs.py \
   -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/lego \
-  -m ./output/TensorIR/lego \
-  --checkpoint ./output/TensorIR/lego/object_step2_sop.ckpt \
+  -m ./output/TensorIR/lego/stage/sop \
+  --checkpoint ./output/TensorIR/lego/stage2/sop/object_step2_sop.ckpt \
   --split test \
   --eval \
   --profile_efficiency \
@@ -292,3 +375,5 @@ CUDA_VISIBLE_DEVICES=3 python render_stage2_sop_importance_sample_object_comgs.p
   --profile_efficiency \
   --profile_efficiency_per_view \
   --disable_sample_jitter
+
+CUDA_VISIBLE_DEVICES=1 python metrics.py -m /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_reproduce/output/TensorIR/lego/stage2/sop/stage2_sop_render
