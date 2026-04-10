@@ -16,22 +16,37 @@ from typing import NamedTuple
 import torch.nn.functional as F
 
 
+def _radical_inverse_vdc(bits):
+    bits = bits.to(torch.int64)
+    bits = ((bits << 16) | (bits >> 16)) & 0xFFFFFFFF
+    bits = (((bits & 0x55555555) << 1) | ((bits & 0xAAAAAAAA) >> 1)) & 0xFFFFFFFF
+    bits = (((bits & 0x33333333) << 2) | ((bits & 0xCCCCCCCC) >> 2)) & 0xFFFFFFFF
+    bits = (((bits & 0x0F0F0F0F) << 4) | ((bits & 0xF0F0F0F0) >> 4)) & 0xFFFFFFFF
+    bits = (((bits & 0x00FF00FF) << 8) | ((bits & 0xFF00FF00) >> 8)) & 0xFFFFFFFF
+    return bits.to(torch.float32) * 2.3283064365386963e-10
+
+
 def fibonacci_sphere_sampling(normals, sample_num, random_rotate=True):
     pre_shape = normals.shape[:-1]
     if len(pre_shape) > 1:
         normals = normals.reshape(-1, 3)
-    delta = np.pi * (3.0 - np.sqrt(5.0))
 
-    # fibonacci sphere sample around z axis
-    idx = torch.arange(sample_num, dtype=torch.float, device='cuda')[None]
-    z = (1 - 2 * idx / (2 * sample_num - 1)).clamp_min(np.sin(10/180*np.pi))
-    rad = torch.sqrt(1 - z ** 2)
-    theta = delta * idx
+    device = normals.device
+    dtype = normals.dtype
+
+    # Replace the previous Fibonacci construction with a uniform Hammersley
+    # sequence on the +Z hemisphere, then rotate it to each shading normal.
+    idx_int = torch.arange(sample_num, device=device, dtype=torch.int64)
+    idx = idx_int.to(dtype=dtype)[None]
+    z = ((idx + 0.5) / sample_num).expand(*pre_shape, sample_num)
+    rad = torch.sqrt((1 - z ** 2).clamp_min(0))
+    theta = 2 * np.pi * _radical_inverse_vdc(idx_int).to(device=device, dtype=dtype)[None]
     if random_rotate:
-        theta = torch.rand(*pre_shape, 1, device='cuda') * 2 * np.pi + theta
+        theta = theta + torch.rand(*pre_shape, 1, device=device, dtype=dtype) * 2 * np.pi
+    theta = theta.expand_as(z)
     y = torch.cos(theta) * rad
     x = torch.sin(theta) * rad
-    z_samples = torch.stack([x, y, z.expand_as(y)], dim=-2)
+    z_samples = torch.stack([x, y, z], dim=-2)
 
     # rotate to normal
     # z_vector = torch.zeros_like(normals)
