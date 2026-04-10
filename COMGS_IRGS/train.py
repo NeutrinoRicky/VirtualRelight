@@ -210,13 +210,8 @@ def save_training_vis(viewpoint_cam, gaussians, background, render_fn, pipe, opt
         save_image(grid, os.path.join(args.visualize_path, f"{iteration:06d}.png"))
 
         env_dict = gaussians.render_env_map()
-
-        grid = [
-            rgb_to_srgb(env_dict["env1"].permute(2, 0, 1)),
-            rgb_to_srgb(env_dict["env2"].permute(2, 0, 1)),
-        ]
-        grid = make_grid(grid, nrow=1, padding=10)
-        save_image(grid, os.path.join(args.visualize_path, f"{iteration:06d}_env.png"))
+        env_image = rgb_to_srgb(env_dict["env"].permute(2, 0, 1))
+        save_image(env_image, os.path.join(args.visualize_path, f"{iteration:06d}_env.png"))
 
       
 NORM_CONDITION_OUTSIDE = False

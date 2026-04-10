@@ -7,6 +7,7 @@ from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 # from scene.light import DirectLightMap as EnvLight
 from scene.light import EnvLight
+from scene.light_utils import octahedral_uv_to_direction
 from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud, rgb_to_srgb
@@ -15,32 +16,14 @@ from surfel_tracer import GaussianTracer
 import trimesh
 from utils.system_utils import Timing
 
-def get_env_direction1(H, W):
-    gy, gx = torch.meshgrid(torch.linspace(0.0 + 0.5 / H, 1.0 - 0.5 / H, H, device='cuda'), 
-                            torch.linspace(-1.0 + 1.0 / W, 1.0 - 1.0 / W, W, device='cuda'),
-                            indexing='ij')
-    sintheta, costheta = torch.sin(gy*np.pi), torch.cos(gy*np.pi)
-    sinphi, cosphi = torch.sin(gx*np.pi), torch.cos(gx*np.pi)
-    env_directions = torch.stack((
-        sintheta*sinphi, 
-        costheta, 
-        -sintheta*cosphi
-        ), dim=-1)
-    return env_directions
-
-
-def get_env_direction2(H, W):
-    gy, gx = torch.meshgrid(torch.linspace(0.0 + 0.5 / H, 1.0 - 0.5 / H, H, device='cuda'), 
-                            torch.linspace(-1.0 + 1.0 / W, 1.0 - 1.0 / W, W, device='cuda'),
-                            indexing='ij')
-    sintheta, costheta = torch.sin(gy*np.pi), torch.cos(gy*np.pi)
-    sinphi, cosphi = torch.sin(gx*np.pi), torch.cos(gx*np.pi)
-    env_directions = torch.stack((
-        sintheta*cosphi,
-        -sintheta*sinphi, 
-        costheta, 
-        ), dim=-1)
-    return env_directions
+def get_env_direction_octahedral(H, W):
+    gy, gx = torch.meshgrid(
+        torch.linspace(0.0 + 0.5 / H, 1.0 - 0.5 / H, H, device='cuda'),
+        torch.linspace(0.0 + 0.5 / W, 1.0 - 0.5 / W, W, device='cuda'),
+        indexing='ij',
+    )
+    uv = torch.stack((gx, gy), dim=-1)
+    return octahedral_uv_to_direction(uv)
 
 
 class GaussianModel:
@@ -96,9 +79,8 @@ class GaussianModel:
         self.init_base_color_value = 0.5
 
         self.env_map = None
-        self.env_H, self.env_W = 256, 512
-        self.env_directions1 = get_env_direction1(self.env_H, self.env_W)
-        self.env_directions2 = get_env_direction2(self.env_H, self.env_W)
+        self.env_H, self.env_W = 256, 256
+        self.env_directions = get_env_direction_octahedral(self.env_H, self.env_W)
         self.ray_tracer = None
         self.setup_functions()
         
@@ -310,14 +292,12 @@ class GaussianModel:
         return torch.cat((features_dc, features_rest), dim=1)
     
     def render_env_map(self, H=512):
-        if H == self.env_H:
-            directions1 = self.env_directions1
-            directions2 = self.env_directions2
+        W = H
+        if H == self.env_H and W == self.env_W:
+            directions = self.env_directions
         else:
-            W = H * 2
-            directions1 = get_env_direction1(H, W)
-            directions2 = get_env_direction2(H, W)
-        return {'env1': self.env_map(directions1, mode="pure_env"), 'env2': self.env_map(directions2, mode="pure_env")}
+            directions = get_env_direction_octahedral(H, W)
+        return {'env': self.env_map(directions, mode="pure_env")}
     
     @property   
     def get_envmap(self): 
@@ -360,7 +340,7 @@ class GaussianModel:
         self._features_dc = nn.Parameter(sh_features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(sh_features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         
-        self.env_map = EnvLight(path=None, device='cuda', resolution=[args.envmap_resolution // 2, args.envmap_resolution], max_res=args.envmap_resolution, init_value=args.envmap_init_value, activation=args.envmap_activation).cuda()
+        self.env_map = EnvLight(path=None, device='cuda', resolution=[args.envmap_resolution, args.envmap_resolution], max_res=args.envmap_resolution, init_value=args.envmap_init_value, activation=args.envmap_activation).cuda()
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def training_setup(self, training_args):

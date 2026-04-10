@@ -132,20 +132,20 @@ class EnvLight(torch.nn.Module):
 
     def __init__(self, path=None, device=None, resolution=None, min_res=8, max_res=128, min_roughness=0.08, max_roughness=0.5, activation='exp', init_value=0.5):
         super().__init__()
-        self.device = device if device is not None else 'cuda' # only supports cuda
-        self.min_res = min_res # minimum resolution for mip-map
-        self.max_res = max_res # maximum resolution for mip-map
+        self.device = device if device is not None else 'cuda'
+        self.min_res = min_res
+        self.max_res = max_res
         self.resolution = resolution
         self.min_roughness = min_roughness
         self.max_roughness = max_roughness
+        self.representation = 'octahedral'
 
         if path is not None:
             latlong_img = self.load(path)
             if resolution is None:
-                resolution = latlong_img.shape[:2]
-            texcoord = pixel_grid(resolution[1], resolution[0])
-            latlong_img = dr.texture(latlong_img[None, ...], texcoord[None, ...], filter_mode='linear')[0].clamp_min(1e-4)
-            self.base = torch.nn.Parameter(latlong_img, requires_grad=True)
+                resolution = [latlong_img.shape[0], latlong_img.shape[0]]
+            octahedral_img = latlong_to_octahedral(latlong_img, resolution, self.device).clamp_min(1e-4)
+            self.base = torch.nn.Parameter(octahedral_img, requires_grad=True)
         else:
             self.base = torch.nn.Parameter(
                 torch.full((resolution[0], resolution[1], 3), init_value, dtype=torch.float32, device=self.device),
@@ -153,8 +153,7 @@ class EnvLight(torch.nn.Module):
             )
         self.transform = None
         self.base_mip = None
-        
-        # self.build_mips()
+
         self.activation_name = activation
         if activation == 'sigmoid':
             self.activation = torch.sigmoid
@@ -166,38 +165,37 @@ class EnvLight(torch.nn.Module):
             self.activation = lambda x: x
         else:
             raise NotImplementedError
-    
+
     def update_pdf(self):
         with torch.no_grad():
-            # Compute PDF
-            Y = pixel_grid(self.base.shape[1], self.base.shape[0])[..., 1]
-            self._pdf = torch.max(self.activation(self.base).clamp_min(0.0), dim=-1)[0] * torch.sin(Y * np.pi) # Scale by sin(theta) for lat-long, https://cs184.eecs.berkeley.edu/sp18/article/25
-            self._pdf = self._pdf / torch.sum(self._pdf)
+            uv = pixel_grid(self.base.shape[1], self.base.shape[0])
+            direction = octahedral_uv_to_direction(uv)
+            texel_solid_angle = octahedral_solid_angle_jacobian(direction)[..., 0]
+            light_strength = torch.max(self.activation(self.base).clamp_min(0.0), dim=-1)[0]
+            self._pdf = light_strength * texel_solid_angle
+            self._pdf = self._pdf / self._pdf.sum().clamp_min(1e-8)
 
     def sample_light_directions(self, B, sample_num, training=False):
         pdf_flat = self._pdf.reshape(-1)
-        light_dir_idx = torch.multinomial(pdf_flat, B*sample_num, replacement=True)
-        
+        light_dir_idx = torch.multinomial(pdf_flat, B * sample_num, replacement=True)
+
         H, W = self._pdf.shape[:2]
-        gx = ((light_dir_idx % W  + 0.5) / W) * 2 - 1
-        gy = (light_dir_idx // W + 0.5) / H
+        u = (light_dir_idx % W).to(torch.float32)
+        v = (light_dir_idx // W).to(torch.float32)
         if training:
-            gx = gx + (torch.rand_like(gx) - 0.5) / W * 2
-            gy = gy + (torch.rand_like(gy) - 0.5) / H
-        sintheta, costheta = torch.sin(gy*np.pi), torch.cos(gy*np.pi)
-        sinphi, cosphi = torch.sin(gx*np.pi), torch.cos(gx*np.pi)
-        direction = torch.stack((
-            sintheta*sinphi, 
-            costheta, 
-            -sintheta*cosphi
-        ), dim=-1)
-        
+            u = (u + torch.rand_like(u)) / W
+            v = (v + torch.rand_like(v)) / H
+        else:
+            u = (u + 0.5) / W
+            v = (v + 0.5) / H
+        uv = torch.stack((u, v), dim=-1).clamp(0.0, 1.0)
+        direction = octahedral_uv_to_direction(uv)
+
         if self.transform is not None:
             direction = direction @ self.transform
         direction = direction.reshape(B, sample_num, 3)
-        
+
         probability = self.light_pdf(direction)
-        
         return direction, probability
 
     def light_pdf(self, direction):
@@ -205,26 +203,27 @@ class EnvLight(torch.nn.Module):
         direction_flat = direction.reshape(-1, 3)
         if self.transform is not None:
             direction_flat = direction_flat @ self.transform.T
+        direction_flat = F.normalize(direction_flat, dim=-1)
+
         H, W = self._pdf.shape[:2]
-        
-        u = (torch.atan2(direction_flat[..., 0], -direction_flat[..., 2]).nan_to_num() / (2.0 * torch.pi) + 0.5)
-        v = torch.acos(direction_flat[..., 1].clamp(-1.0 + 1e-6, 1.0 - 1e-6)) / torch.pi
-        
-        u_idx = (u * W).clamp(0, W - 1).long()
-        v_idx = (v * H).clamp(0, H - 1).long()
+        uv = direction_to_octahedral_uv(direction_flat)
+        u_idx = (uv[..., 0].clamp(0.0, 1.0 - 1e-6) * W).long()
+        v_idx = (uv[..., 1].clamp(0.0, 1.0 - 1e-6) * H).long()
         light_dir_idx = u_idx + v_idx * W
-        
-        pdf_weight = H * W / (2.0 * torch.pi ** 2 * torch.sin(v * torch.pi).clamp_min(1e-6))
-        probability = (torch.take_along_dim(pdf_flat, light_dir_idx, dim=0) * pdf_weight).reshape(*direction.shape[:2], 1)
+
+        jacobian = octahedral_solid_angle_jacobian(direction_flat)[..., 0].clamp_min(1e-6)
+        pdf_weight = H * W / jacobian
+        probability = (pdf_flat[light_dir_idx] * pdf_weight).reshape(*direction.shape[:2], 1)
         return probability
 
     def capture(self):
         state_dict = super().state_dict()
         return {
-            "state_dict": state_dict,
-            "activation": self.activation_name
+            'state_dict': state_dict,
+            'activation': self.activation_name,
+            'representation': self.representation,
         }
-    
+
     def restore(self, model_args):
         activation = model_args['activation']
         self.activation_name = activation
@@ -236,31 +235,34 @@ class EnvLight(torch.nn.Module):
             self.activation = lambda x: x
         else:
             raise NotImplementedError
-        self.load_state_dict(model_args['state_dict'])
-    
+
+        representation = model_args.get('representation', 'latlong')
+        state_dict = model_args['state_dict']
+        if representation == 'octahedral':
+            self.load_state_dict(state_dict)
+        elif representation == 'latlong':
+            with torch.no_grad():
+                self.base.data = latlong_to_octahedral(state_dict['base'].to(self.device), self.base.shape[:2], self.device)
+        else:
+            raise NotImplementedError(f'Unsupported environment map representation: {representation}')
+
     def set_transform(self, transform):
         self.transform = transform
 
     def load(self, path):
-        """
-        Load an .hdr or .exr environment light map file and convert it to cubemap.
-        """
-        if path.endswith(".exr"):
+        if path.endswith('.exr'):
             image = pyexr.open(path).get()[:, :, :3]
-        elif path.endswith(".hdr"):  # #
+        elif path.endswith('.hdr'):
             image = imageio.imread(path, format='HDR-FI')[:, :, :3]
         else:
             image = srgb_to_rgb(imageio.imread(path)[:, :, :3] / 255)
-            
+
         image = torch.from_numpy(image).to(self.device)
         return image
 
     def build_mips(self, cutoff=0.99):
-        """
-        Build mip-maps for specular reflection based on cubemap.
-        """
-        self.base_mip = latlong_to_cubemap(self.base, [self.max_res, self.max_res], self.device)
-        
+        self.base_mip = octahedral_to_cubemap(self.base, [self.max_res, self.max_res], self.device)
+
         self.specular = [self.base_mip]
         while self.specular[-1].shape[1] > self.min_res:
             self.specular += [cubemap_mip.apply(self.specular[-1])]
@@ -269,56 +271,42 @@ class EnvLight(torch.nn.Module):
 
         for idx in range(len(self.specular) - 1):
             roughness = (idx / (len(self.specular) - 2)) * (self.max_roughness - self.min_roughness) + self.min_roughness
-            self.specular[idx] = ru.specular_cubemap(self.specular[idx], roughness, cutoff) 
+            self.specular[idx] = ru.specular_cubemap(self.specular[idx], roughness, cutoff)
 
         self.specular[-1] = ru.specular_cubemap(self.specular[-1], 1.0, cutoff)
 
     def get_mip(self, roughness):
-        """
-        Map roughness to mip level.
-        """
         return torch.where(
-            roughness < self.max_roughness, 
-            (torch.clamp(roughness, self.min_roughness, self.max_roughness) - self.min_roughness) / (self.max_roughness - self.min_roughness) * (len(self.specular) - 2), 
-            (torch.clamp(roughness, self.max_roughness, 1.0) - self.max_roughness) / (1.0 - self.max_roughness) + len(self.specular) - 2
+            roughness < self.max_roughness,
+            (torch.clamp(roughness, self.min_roughness, self.max_roughness) - self.min_roughness) / (self.max_roughness - self.min_roughness) * (len(self.specular) - 2),
+            (torch.clamp(roughness, self.max_roughness, 1.0) - self.max_roughness) / (1.0 - self.max_roughness) + len(self.specular) - 2,
         )
 
     def __call__(self, l, mode='pure_env', roughness=None):
-        """
-        Query the environment light based on direction and roughness.
-        """
-                
         prefix = l.shape[:-1]
-        if len(prefix) != 3:  # Reshape to [B, H, W, -1] if necessary
+        if len(prefix) != 3:
             l = l.reshape(1, 1, -1, l.shape[-1])
             if self.transform is not None:
                 l = l @ self.transform.T
             if roughness is not None:
                 roughness = roughness.reshape(1, 1, -1, 1)
 
-        if mode == "diffuse":
-            # Diffuse lighting
+        if mode == 'diffuse':
             light = dr.texture(self.diffuse[None, ...], l.contiguous(), filter_mode='linear', boundary_mode='cube')
-        elif mode == "pure_env":
-            uv = torch.cat([
-                (torch.atan2(l[..., :1], -l[..., 2:3]).nan_to_num() / (2.0 * torch.pi) + 0.5),
-                torch.acos(l[..., 1:2].clamp(-1.0 + 1e-6, 1.0 - 1e-6)) / torch.pi,
-            ], dim=-1).clamp(0, 1)
-            light = dr.texture(self.base[None, ...], uv, filter_mode='linear')
+        elif mode == 'pure_env':
+            uv = direction_to_octahedral_uv(l).clamp(0.0, 1.0)
+            light = dr.texture(self.base[None, ...], uv, filter_mode='linear', boundary_mode='clamp')
         else:
-            # Specular lighting with mip-mapping
             miplevel = self.get_mip(roughness)
             light = dr.texture(
-                self.specular[0][None, ...], 
+                self.specular[0][None, ...],
                 l,
-                mip=list(m[None, ...] for m in self.specular[1:]), 
-                mip_level_bias=miplevel[..., 0], 
-                filter_mode='linear-mipmap-linear', 
-                boundary_mode='cube'
+                mip=list(m[None, ...] for m in self.specular[1:]),
+                mip_level_bias=miplevel[..., 0],
+                filter_mode='linear-mipmap-linear',
+                boundary_mode='cube',
             )
         light = light.view(*prefix, -1)
-        
-        # return self.activation(light).clamp(0, 3)
         return self.activation(light).clamp_min(0.0)
 
 
