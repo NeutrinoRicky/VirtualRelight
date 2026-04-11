@@ -10,12 +10,14 @@
 #
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 import math
 from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.point_utils import depth_to_normal, depths_to_points
 from utils.graphics_utils import rotation_between_z, fibonacci_sphere_sampling, rgb_to_srgb, srgb_to_rgb
 from utils.refl_utils import  get_specular_color_surfel, get_full_color_volume, get_full_color_volume_indirect, get_specular_color_surfel2
+from utils.sop_utils import query_sops_directional
 from .ref_gaussian import render_initial, render_surfel, render_volume, render_surfel2
 import numpy as np
 from utils.system_utils import Timing
@@ -68,6 +70,60 @@ def compute_2dgs_normal_and_regularizations(allmap, viewpoint_camera, pipe):
         'render_var': render_var,
     }
 
+
+def render_sop_gbuffer(
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    bg_color: torch.Tensor,
+    scaling_modifier=1.0,
+    override_color=None,
+    opt=None,
+    iteration=-1,
+    training=False,
+    base_color_scale=None,
+):
+    render_pkg_ir = render_ir(
+        viewpoint_camera,
+        pc,
+        pipe,
+        bg_color,
+        scaling_modifier=scaling_modifier,
+        override_color=override_color,
+        opt=opt,
+        iteration=iteration,
+        training=training,
+        base_color_scale=base_color_scale,
+        material_only=True,
+    )
+    alpha_denom = render_pkg_ir["rend_alpha"].clamp_min(1e-6)
+    return {
+        "weight": render_pkg_ir["rend_alpha"][0],
+        "depth_unbiased": render_pkg_ir["surf_depth"][0],
+        "normal": F.normalize(render_pkg_ir["surf_normal"], dim=0, eps=1e-6),
+        "normal_shading": F.normalize(render_pkg_ir["rend_normal"] / alpha_denom, dim=0, eps=1e-6),
+        "albedo": render_pkg_ir["base_color_linear"],
+        "roughness": render_pkg_ir["roughness"],
+        "metallic": render_pkg_ir["metallic"],
+        "render_pkg_ir": render_pkg_ir,
+    }
+
+
+def _cuda_mem_debug_enabled(debug_cfg) -> bool:
+    return bool(debug_cfg) and bool(debug_cfg.get("enabled", False)) and torch.cuda.is_available()
+
+
+def _log_cuda_mem(debug_cfg, label: str) -> None:
+    if not _cuda_mem_debug_enabled(debug_cfg):
+        return
+    torch.cuda.synchronize()
+    prefix = debug_cfg.get("prefix", "")
+    if prefix:
+        label = f"{prefix} | {label}"
+    allocated = torch.cuda.memory_allocated() / (1024 ** 2)
+    peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
+    reserved = torch.cuda.memory_reserved() / (1024 ** 2)
+    print(f"[CUDA-MEM] {label}: alloc={allocated:.1f} MiB peak={peak:.1f} MiB reserved={reserved:.1f} MiB")
 
 
 def render_ir(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, opt=None, iteration=-1, training=False, relight=False, base_color_scale=None, material_only=False):
@@ -323,6 +379,167 @@ def rendering_equation_chunk(base_color, roughness, metallic, normal, position, 
         for i in range(0, base_color.shape[0], chunk_size):
             results.append(rendering_equation(base_color[i:i+chunk_size], roughness[i:i+chunk_size], metallic[i:i+chunk_size], normal[i:i+chunk_size], position[i:i+chunk_size], w_o[i:i+chunk_size], pc, pipe, training, f0, relight=relight, camera_center=camera_center, **kwargs))
         return {k: torch.cat([r[k] for r in results], 0) for k in results[0]}
+
+
+def rendering_equation_sop_chunk(
+    base_color,
+    roughness,
+    metallic,
+    normal,
+    position,
+    w_o,
+    pc,
+    pipe,
+    probe_xyz,
+    probe_normal,
+    probe_lin_tex,
+    probe_occ_tex,
+    sample_training=False,
+    f0=0.04,
+    sop_query_radius=None,
+    sop_query_topk=8,
+    sop_query_chunk_size=1024,
+    chunk_size=2**20,
+    eps=1e-6,
+    cuda_mem_debug=None,
+):
+    chunk_size = max(chunk_size // max(pipe.diffuse_sample_num + pipe.light_sample_num, 1), 1)
+    if base_color.shape[0] <= chunk_size:
+        return rendering_equation_sop(
+            base_color,
+            roughness,
+            metallic,
+            normal,
+            position,
+            w_o,
+            pc,
+            pipe,
+            probe_xyz,
+            probe_normal,
+            probe_lin_tex,
+            probe_occ_tex,
+            sample_training=sample_training,
+            f0=f0,
+            sop_query_radius=sop_query_radius,
+            sop_query_topk=sop_query_topk,
+            sop_query_chunk_size=sop_query_chunk_size,
+            eps=eps,
+            cuda_mem_debug=cuda_mem_debug,
+        )
+
+    total_points = base_color.shape[0]
+    outputs = None
+    use_activation_checkpoint = not _cuda_mem_debug_enabled(cuda_mem_debug)
+    for i in range(0, total_points, chunk_size):
+        j = min(i + chunk_size, total_points)
+        chunk_debug = None
+        if _cuda_mem_debug_enabled(cuda_mem_debug):
+            remaining = int(cuda_mem_debug.get("rendering_equation_sop_logs_remaining", 0))
+            if remaining > 0:
+                chunk_debug = cuda_mem_debug
+                cuda_mem_debug["rendering_equation_sop_logs_remaining"] = remaining - 1
+
+        base_color_chunk = base_color[i:j]
+        roughness_chunk = roughness[i:j]
+        metallic_chunk = metallic[i:j]
+        normal_chunk = normal[i:j]
+        position_chunk = position[i:j]
+        w_o_chunk = w_o[i:j]
+
+        if use_activation_checkpoint:
+            def _chunk_forward(
+                base_color_t,
+                roughness_t,
+                metallic_t,
+                normal_t,
+                position_t,
+                w_o_t,
+                probe_lin_tex_t,
+                probe_occ_tex_t,
+            ):
+                results = rendering_equation_sop(
+                    base_color_t,
+                    roughness_t,
+                    metallic_t,
+                    normal_t,
+                    position_t,
+                    w_o_t,
+                    pc,
+                    pipe,
+                    probe_xyz,
+                    probe_normal,
+                    probe_lin_tex_t,
+                    probe_occ_tex_t,
+                    sample_training=sample_training,
+                    f0=f0,
+                    sop_query_radius=sop_query_radius,
+                    sop_query_topk=sop_query_topk,
+                    sop_query_chunk_size=sop_query_chunk_size,
+                    eps=eps,
+                    cuda_mem_debug=None,
+                )
+                return (
+                    results["diffuse"],
+                    results["specular"],
+                    results["visibility"],
+                    results["light"],
+                    results["light_indirect"],
+                    results["light_direct"],
+                )
+
+            chunk_tuple = torch_checkpoint(
+                _chunk_forward,
+                base_color_chunk,
+                roughness_chunk,
+                metallic_chunk,
+                normal_chunk,
+                position_chunk,
+                w_o_chunk,
+                probe_lin_tex,
+                probe_occ_tex,
+                use_reentrant=False,
+            )
+            chunk_results = {
+                "diffuse": chunk_tuple[0],
+                "specular": chunk_tuple[1],
+                "visibility": chunk_tuple[2],
+                "light": chunk_tuple[3],
+                "light_indirect": chunk_tuple[4],
+                "light_direct": chunk_tuple[5],
+            }
+        else:
+            chunk_results = rendering_equation_sop(
+                base_color_chunk,
+                roughness_chunk,
+                metallic_chunk,
+                normal_chunk,
+                position_chunk,
+                w_o_chunk,
+                pc,
+                pipe,
+                probe_xyz,
+                probe_normal,
+                probe_lin_tex,
+                probe_occ_tex,
+                sample_training=sample_training,
+                f0=f0,
+                sop_query_radius=sop_query_radius,
+                sop_query_topk=sop_query_topk,
+                sop_query_chunk_size=sop_query_chunk_size,
+                eps=eps,
+                cuda_mem_debug=chunk_debug,
+            )
+
+        if outputs is None:
+            outputs = {
+                key: value.new_empty((total_points, *value.shape[1:]))
+                for key, value in chunk_results.items()
+            }
+
+        for key, value in chunk_results.items():
+            outputs[key][i:j] = value
+
+    return outputs
     
 def sample_incident_rays(normals, is_training=False, sample_num=24):
     if is_training:
@@ -334,32 +551,36 @@ def sample_incident_rays(normals, is_training=False, sample_num=24):
 
     return incident_dirs, incident_areas  # [N, S, 3], [N, S, 1]
 
-def rendering_equation(base_color, roughness, metallic, normals, position, viewdirs, pc, pipe, training=False, f0=0.04, relight=False, camera_center=None, **kwargs):
-    B = base_color.shape[0]
-    envmap = pc.get_envmap
-    
+
+def _sample_incident_transport(normals, pc, pipe, is_training=False):
+    B = normals.shape[0]
     if pipe.diffuse_sample_num > 0 and pipe.light_sample_num == 0:
-        incident_dirs, incident_areas = sample_incident_rays(normals, training, pipe.diffuse_sample_num)
+        incident_dirs, incident_areas = sample_incident_rays(normals, is_training, pipe.diffuse_sample_num)
     elif pipe.diffuse_sample_num > 0 and pipe.light_sample_num > 0:
         p_diffuse = pipe.diffuse_sample_num / (pipe.diffuse_sample_num + pipe.light_sample_num)
         p_light = pipe.light_sample_num / (pipe.diffuse_sample_num + pipe.light_sample_num)
-    
-        diffuse_directions, diffuse_areas = sample_incident_rays(normals, training, pipe.diffuse_sample_num)
+
+        diffuse_directions, diffuse_areas = sample_incident_rays(normals, is_training, pipe.diffuse_sample_num)
         diffuse_pdfs = 1 / diffuse_areas
-        
-        light_directions, light_pdfs = pc.get_envmap.sample_light_directions(B, pipe.light_sample_num, training)
-    
+
+        light_directions, light_pdfs = pc.get_envmap.sample_light_directions(B, pipe.light_sample_num, is_training)
+
         diffuse_pdfs_light = 1 / (2 * np.pi)
         light_pdfs_diffuse = pc.get_envmap.light_pdf(diffuse_directions)
-        
+
         diffuse_pdfs = diffuse_pdfs * p_diffuse + light_pdfs_diffuse * p_light
         light_pdfs = diffuse_pdfs_light * p_diffuse + light_pdfs * p_light
-        
+
         incident_dirs = torch.cat([diffuse_directions, light_directions], dim=1)
         incident_pdfs = torch.cat([diffuse_pdfs, light_pdfs], dim=1)
         incident_areas = 1 / incident_pdfs.clamp_min(1e-6)
     else:
         raise NotImplementedError
+    return incident_dirs, incident_areas
+
+def rendering_equation(base_color, roughness, metallic, normals, position, viewdirs, pc, pipe, training=False, f0=0.04, relight=False, camera_center=None, **kwargs):
+    envmap = pc.get_envmap
+    incident_dirs, incident_areas = _sample_incident_transport(normals, pc, pipe, training)
     global_incident_lights = envmap(incident_dirs, mode='pure_env')
     dielectric_f0 = _broadcast_to_target(f0, base_color)
     
@@ -419,6 +640,76 @@ def rendering_equation(base_color, roughness, metallic, normals, position, viewd
             "light_indirect": local_incident_lights.mean(dim=1),
             "light_direct": global_incident_lights.mean(dim=1),
         }
+    return results
+
+
+def rendering_equation_sop(
+    base_color,
+    roughness,
+    metallic,
+    normals,
+    position,
+    viewdirs,
+    pc,
+    pipe,
+    probe_xyz,
+    probe_normal,
+    probe_lin_tex,
+    probe_occ_tex,
+    sample_training=False,
+    f0=0.04,
+    sop_query_radius=None,
+    sop_query_topk=8,
+    sop_query_chunk_size=1024,
+    eps=1e-6,
+    cuda_mem_debug=None,
+):
+    _log_cuda_mem(cuda_mem_debug, "before rendering_equation_sop_inner")
+    envmap = pc.get_envmap
+    incident_dirs, incident_areas = _sample_incident_transport(normals, pc, pipe, sample_training)
+    global_incident_lights = envmap(incident_dirs, mode='pure_env')
+    _log_cuda_mem(cuda_mem_debug, "before query_sops_directional")
+    query_indirect, query_occlusion = query_sops_directional(
+        x_world=position,
+        query_dirs=incident_dirs,
+        probe_xyz=probe_xyz,
+        probe_normal=probe_normal,
+        probe_lin_tex=probe_lin_tex,
+        probe_occ_tex=probe_occ_tex,
+        radius=sop_query_radius,
+        topk=sop_query_topk,
+        eps=eps,
+        chunk_size=sop_query_chunk_size,
+    )
+    _log_cuda_mem(cuda_mem_debug, "after query_sops_directional")
+
+    incident_visibility = 1 - query_occlusion
+    local_incident_lights = query_indirect
+    if pipe.wo_indirect:
+        local_incident_lights = torch.zeros_like(local_incident_lights)
+    if pipe.detach_indirect:
+        incident_visibility = incident_visibility.detach()
+        local_incident_lights = local_incident_lights.detach()
+    incident_lights = incident_visibility * global_incident_lights + local_incident_lights
+
+    dielectric_f0 = _broadcast_to_target(f0, base_color)
+    n_d_i = (normals[:, None] * incident_dirs).sum(-1, keepdim=True).clamp(min=0)
+    specular_f0 = dielectric_f0 * (1 - metallic) + base_color * metallic
+    f_d = (1 - metallic)[:, None] * base_color[:, None] / np.pi
+    f_s = GGX_specular(normals, viewdirs, incident_dirs, roughness, fresnel=specular_f0)
+
+    transport = incident_lights * incident_areas * n_d_i
+    diffuse = (f_d * transport).mean(dim=-2)
+    specular = (f_s * transport).mean(dim=-2)
+    results = {
+        "diffuse": diffuse,
+        "specular": specular,
+        "visibility": incident_visibility.mean(dim=1),
+        "light": incident_lights.mean(dim=1),
+        "light_indirect": local_incident_lights.mean(dim=1),
+        "light_direct": global_incident_lights.mean(dim=1),
+    }
+    _log_cuda_mem(cuda_mem_debug, "after rendering_equation_sop_inner")
     return results
 
 def GGX_specular(

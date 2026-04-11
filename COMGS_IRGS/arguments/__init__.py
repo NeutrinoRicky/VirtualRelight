@@ -44,9 +44,15 @@ class ParamGroup:
 
     def extract(self, args):
         group = GroupParams()
+        for key, value in vars(self).items():
+            if key.startswith("_"):
+                key = key[1:]
+            setattr(group, key, value)
+
         for arg in vars(args).items():
             if arg[0] in vars(self) or ("_" + arg[0]) in vars(self):
-                setattr(group, arg[0], arg[1])
+                if arg[1] is not None:
+                    setattr(group, arg[0], arg[1])
         return group
 
 class ModelParams(ParamGroup): 
@@ -154,20 +160,53 @@ class OptimizationParams(ParamGroup):
         self.trace_num_rays = 2**18
         super().__init__(parser, "Optimization Parameters")
 
+def _existing_cfg_args_candidates(args_cmdline):
+    candidates = []
+
+    model_path = getattr(args_cmdline, "model_path", "")
+    if model_path:
+        candidates.append(os.path.join(model_path, "cfg_args"))
+
+    for attr_name in ("checkpoint", "start_checkpoint_refgs", "start_checkpoint"):
+        checkpoint_path = getattr(args_cmdline, attr_name, "")
+        if not checkpoint_path:
+            continue
+        checkpoint_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+        candidates.append(os.path.join(checkpoint_dir, "cfg_args"))
+
+    if model_path:
+        model_dir = os.path.abspath(model_path)
+        scene_output_dir = os.path.dirname(model_dir)
+        for sibling_name in ("refgs", "irgs"):
+            candidates.append(os.path.join(scene_output_dir, sibling_name, "cfg_args"))
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        yield candidate
+
+
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
     args_cmdline = parser.parse_args(cmdlne_string)
 
-    try:
-        cfgfilepath = os.path.join(args_cmdline.model_path, "cfg_args")
-        print("Looking for config file in", cfgfilepath)
+    cfgfilepath = None
+    for candidate in _existing_cfg_args_candidates(args_cmdline):
+        print("Looking for config file in", candidate)
+        if os.path.exists(candidate):
+            cfgfilepath = candidate
+            break
+
+    if cfgfilepath is not None:
         with open(cfgfilepath) as cfg_file:
             print("Config file found: {}".format(cfgfilepath))
             cfgfile_string = cfg_file.read()
-    except TypeError:
-        print("Config file not found at")
-        pass
+    else:
+        print("Config file not found; using command line/default arguments.")
+
     args_cfgfile = eval(cfgfile_string)
 
     merged_dict = vars(args_cfgfile).copy()
