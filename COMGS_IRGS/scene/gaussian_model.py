@@ -26,6 +26,36 @@ def get_env_direction_octahedral(H, W):
     return octahedral_uv_to_direction(uv)
 
 
+def get_env_direction1(H, W):
+    gy, gx = torch.meshgrid(
+        torch.linspace(0.0 + 0.5 / H, 1.0 - 0.5 / H, H, device='cuda'),
+        torch.linspace(-1.0 + 1.0 / W, 1.0 - 1.0 / W, W, device='cuda'),
+        indexing='ij',
+    )
+    sintheta, costheta = torch.sin(gy * np.pi), torch.cos(gy * np.pi)
+    sinphi, cosphi = torch.sin(gx * np.pi), torch.cos(gx * np.pi)
+    return torch.stack((
+        sintheta * sinphi,
+        costheta,
+        -sintheta * cosphi,
+    ), dim=-1)
+
+
+def get_env_direction2(H, W):
+    gy, gx = torch.meshgrid(
+        torch.linspace(0.0 + 0.5 / H, 1.0 - 0.5 / H, H, device='cuda'),
+        torch.linspace(-1.0 + 1.0 / W, 1.0 - 1.0 / W, W, device='cuda'),
+        indexing='ij',
+    )
+    sintheta, costheta = torch.sin(gy * np.pi), torch.cos(gy * np.pi)
+    sinphi, cosphi = torch.sin(gx * np.pi), torch.cos(gx * np.pi)
+    return torch.stack((
+        sintheta * cosphi,
+        -sintheta * sinphi,
+        costheta,
+    ), dim=-1)
+
+
 class GaussianModel:
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(center, scaling, scaling_modifier, rotation):
@@ -292,6 +322,12 @@ class GaussianModel:
         return torch.cat((features_dc, features_rest), dim=1)
     
     def render_env_map(self, H=512):
+        if self.env_map is not None and getattr(self.env_map, "representation", "octahedral") == "latlong":
+            W = H * 2
+            directions1 = get_env_direction1(H, W)
+            directions2 = get_env_direction2(H, W)
+            return {'env1': self.env_map(directions1, mode="pure_env"), 'env2': self.env_map(directions2, mode="pure_env")}
+
         W = H
         if H == self.env_H and W == self.env_W:
             directions = self.env_directions
@@ -340,7 +376,12 @@ class GaussianModel:
         self._features_dc = nn.Parameter(sh_features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(sh_features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         
-        self.env_map = EnvLight(path=None, device='cuda', resolution=[args.envmap_resolution, args.envmap_resolution], max_res=args.envmap_resolution, init_value=args.envmap_init_value, activation=args.envmap_activation).cuda()
+        envmap_representation = getattr(args, "envmap_representation", "octahedral")
+        if envmap_representation == "latlong":
+            envmap_resolution = [args.envmap_resolution // 2, args.envmap_resolution]
+        else:
+            envmap_resolution = [args.envmap_resolution, args.envmap_resolution]
+        self.env_map = EnvLight(path=None, device='cuda', resolution=envmap_resolution, max_res=args.envmap_resolution, init_value=args.envmap_init_value, activation=args.envmap_activation, representation=envmap_representation).cuda()
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def training_setup(self, training_args):
@@ -464,7 +505,9 @@ class GaussianModel:
         map_path = path.replace('.ply', '1.map')
         if os.path.exists(map_path):
             map_ckpt = torch.load(map_path)
-            self.env_map = EnvLight(path=None, device='cuda', resolution=map_ckpt['state_dict']['base'].shape[:2]).cuda()
+            representation = map_ckpt.get('representation', 'latlong')
+            resolution = map_ckpt['state_dict']['base'].shape[:2]
+            self.env_map = EnvLight(path=None, device='cuda', resolution=resolution, max_res=max(resolution), representation=representation).cuda()
             self.env_map.restore(map_ckpt)
 
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))

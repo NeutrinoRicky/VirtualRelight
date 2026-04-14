@@ -75,6 +75,7 @@ class ModelParams(ParamGroup):
 
         # EnvLight Settings
         self.envmap_resolution = 8
+        self.envmap_representation = 'octahedral'
         self.relight = False
         self.envmap_init_value = 1.5
         self.envmap_activation = 'exp'
@@ -84,6 +85,8 @@ class ModelParams(ParamGroup):
     def extract(self, args):
         group = super().extract(args)
         group.source_path = os.path.abspath(group.source_path)
+        if group.envmap_representation not in ('latlong', 'octahedral'):
+            raise ValueError("--envmap_representation must be either 'latlong' or 'octahedral'")
         return group
 
 

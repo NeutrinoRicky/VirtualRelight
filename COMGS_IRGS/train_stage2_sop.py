@@ -254,8 +254,16 @@ def save_training_vis(viewpoint_cam, gaussians, background, pipe, opt, sop_state
     save_image(grid, os.path.join(args.visualize_path, f"{iteration:06d}.png"))
 
     env_dict = gaussians.render_env_map()
-    env_image = rgb_to_srgb(env_dict["env"].permute(2, 0, 1))
-    save_image(env_image, os.path.join(args.visualize_path, f"{iteration:06d}_env.png"))
+    if "env1" in env_dict and "env2" in env_dict:
+        env_grid = [
+            rgb_to_srgb(env_dict["env1"].permute(2, 0, 1)),
+            rgb_to_srgb(env_dict["env2"].permute(2, 0, 1)),
+        ]
+        env_grid = make_grid(env_grid, nrow=1, padding=10)
+        save_image(env_grid, os.path.join(args.visualize_path, f"{iteration:06d}_env.png"))
+    else:
+        env_image = rgb_to_srgb(env_dict["env"].permute(2, 0, 1))
+        save_image(env_image, os.path.join(args.visualize_path, f"{iteration:06d}_env.png"))
 
 
 def training_stage2_sop(dataset, opt, pipe, args):
@@ -300,6 +308,11 @@ def training_stage2_sop(dataset, opt, pipe, args):
     ema_lam = 0.0
     ema_d2n = 0.0
     ema_mask = 0.0
+    ema_light = 0.0
+    ema_base_color_smooth = 0.0
+    ema_roughness_smooth = 0.0
+    ema_normal_smooth = 0.0
+    ema_light_smooth = 0.0
 
     viewpoint_stack = None
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Stage2 SOP training")
@@ -379,6 +392,11 @@ def training_stage2_sop(dataset, opt, pipe, args):
             ema_lam = 0.4 * loss_stats["loss_lam"].item() + 0.6 * ema_lam
             ema_d2n = 0.4 * loss_stats["loss_d2n"].item() + 0.6 * ema_d2n
             ema_mask = 0.4 * loss_stats["loss_mask"].item() + 0.6 * ema_mask
+            ema_light = 0.4 * loss_stats["loss_light"].item() + 0.6 * ema_light
+            ema_base_color_smooth = 0.4 * loss_stats["loss_base_color_smooth"].item() + 0.6 * ema_base_color_smooth
+            ema_roughness_smooth = 0.4 * loss_stats["loss_roughness_smooth"].item() + 0.6 * ema_roughness_smooth
+            ema_normal_smooth = 0.4 * loss_stats["loss_normal_smooth"].item() + 0.6 * ema_normal_smooth
+            ema_light_smooth = 0.4 * loss_stats["loss_light_smooth"].item() + 0.6 * ema_light_smooth
 
             if iteration % 10 == 0:
                 progress_bar.set_postfix(
@@ -388,6 +406,11 @@ def training_stage2_sop(dataset, opt, pipe, args):
                         "lam": f"{ema_lam:.5f}",
                         "d2n": f"{ema_d2n:.5f}",
                         "mask": f"{ema_mask:.5f}",
+                        "light": f"{ema_light:.5f}",
+                        "bc_sm": f"{ema_base_color_smooth:.5f}",
+                        "r_sm": f"{ema_roughness_smooth:.5f}",
+                        "n_sm": f"{ema_normal_smooth:.5f}",
+                        "l_sm": f"{ema_light_smooth:.5f}",
                         "pts": f"{int(loss_stats['shading_points'].item())}",
                     }
                 )
@@ -441,7 +464,7 @@ def _build_parser():
     parser.add_argument("--start_checkpoint_refgs", type=str, default="")
     parser.add_argument("--sop_init", type=str, default="")
 
-    parser.add_argument("--lambda_lam", type=float, default=0.001)
+    parser.add_argument("--lambda_lam", type=float, default=0.0)
     parser.add_argument("--lambda_sops", type=float, default=0.0)
     parser.add_argument("--lambda_d2n", type=float, default=0.05)
     parser.add_argument("--lambda_mask", type=float, default=0.05)

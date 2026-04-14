@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from gaussian_renderer import rendering_equation_sop_chunk
 from utils.graphics_utils import rgb_to_srgb
-from utils.loss_utils import ssim
+from utils.loss_utils import first_order_edge_aware_loss, ssim, tv_loss
 
 
 def _as_single_channel(x: torch.Tensor) -> torch.Tensor:
@@ -134,6 +134,21 @@ def _get_supervision_mask(viewpoint_camera, ref_tensor: torch.Tensor):
     return torch.clamp(mask.to(device=ref_tensor.device, dtype=ref_tensor.dtype), 0.0, 1.0)
 
 
+def _get_regularization_mask(viewpoint_camera, ref_tensor: torch.Tensor):
+    mask = getattr(viewpoint_camera, "mask", None)
+    if mask is None:
+        return None
+
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0)
+    elif mask.dim() == 3 and mask.shape[0] != 1:
+        mask = mask[:1]
+
+    if mask.shape[-2:] != ref_tensor.shape[-2:]:
+        mask = F.interpolate(mask.unsqueeze(0), size=ref_tensor.shape[-2:], mode="bilinear", align_corners=False).squeeze(0)
+    return torch.clamp(mask.to(device=ref_tensor.device, dtype=ref_tensor.dtype), 0.0, 1.0)
+
+
 def _scatter_to_image(values: torch.Tensor, flat_indices: torch.Tensor, height: int, width: int, channels: int) -> torch.Tensor:
     canvas = values.new_zeros((height * width, channels))
     if flat_indices.numel() > 0:
@@ -164,6 +179,28 @@ def _log_cuda_mem(debug_cfg, label: str) -> None:
     print(f"[CUDA-MEM] {label}: alloc={allocated:.1f} MiB peak={peak:.1f} MiB reserved={reserved:.1f} MiB")
 
 
+def _opt_weight(opt, name: str) -> float:
+    if opt is None:
+        return 0.0
+    return float(getattr(opt, name, 0.0))
+
+
+def _masked_edge_aware_loss(data: torch.Tensor, gt_rgb: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+    if mask is not None:
+        data = data * mask
+    return first_order_edge_aware_loss(data, gt_rgb)
+
+
+def _compute_env_smooth_loss(gaussians, viewpoint_camera, gt_rgb: torch.Tensor) -> torch.Tensor:
+    envmap = getattr(gaussians, "get_envmap", None)
+    rays_d = getattr(viewpoint_camera, "rays_d_hw", None)
+    if envmap is None or rays_d is None:
+        return gt_rgb.new_tensor(0.0)
+
+    env_only = rgb_to_srgb(envmap(rays_d, mode="pure_env").permute(2, 0, 1))
+    return tv_loss(env_only)
+
+
 def compute_stage2_sop_loss(
     render_pkg: Dict[str, torch.Tensor],
     gt_rgb: torch.Tensor,
@@ -177,7 +214,7 @@ def compute_stage2_sop_loss(
     probe_normal: torch.Tensor = None,
     probe_lin_tex: torch.Tensor = None,
     probe_occ_tex: torch.Tensor = None,
-    lambda_lam: float = 0.001,
+    lambda_lam: float = 0.0,
     lambda_sops: float = 0.0,
     lambda_d2n: float = 0.05,
     lambda_mask: float = 0.05,
@@ -234,6 +271,7 @@ def compute_stage2_sop_loss(
     indirect_map = gt_rgb.new_zeros((3, height, width))
     pbr_diffuse_map = gt_rgb.new_zeros((3, height, width))
     pbr_specular_map = gt_rgb.new_zeros((3, height, width))
+    light_direct_values = None
 
     if shading_idx.numel() > 0:
         pts = points.reshape(-1, 3)[shading_idx]
@@ -269,6 +307,7 @@ def compute_stage2_sop_loss(
 
         diffuse_linear = render_results["diffuse"]
         specular_linear = render_results["specular"]
+        light_direct_values = render_results["light_direct"]
         pbr_linear = diffuse_linear + specular_linear
         pbr_rgb = rgb_to_srgb(pbr_linear) * alpha + bg_color.view(1, 3) * (1.0 - alpha)
 
@@ -371,8 +410,57 @@ def compute_stage2_sop_loss(
     else:
         loss_mask = gt_rgb.new_tensor(0.0)
 
+    lambda_base_color_smooth = _opt_weight(opt, "lambda_base_color_smooth") if training else 0.0
+    lambda_roughness_smooth = _opt_weight(opt, "lambda_roughness_smooth") if training else 0.0
+    lambda_normal_smooth = _opt_weight(opt, "lambda_normal_smooth") if training else 0.0
+    lambda_light = _opt_weight(opt, "lambda_light") if training else 0.0
+    lambda_light_smooth = _opt_weight(opt, "lambda_light_smooth") if training else 0.0
+
+    reg_mask = _get_regularization_mask(viewpoint_camera, gt_rgb)
+    render_pkg_ir = render_pkg.get("render_pkg_ir", {})
+
+    if lambda_light > 0 and light_direct_values is not None and light_direct_values.numel() > 0:
+        mean_light = light_direct_values.mean(-1, keepdim=True).expand_as(light_direct_values)
+        loss_light = F.l1_loss(light_direct_values, mean_light)
+    else:
+        loss_light = gt_rgb.new_tensor(0.0)
+
+    if lambda_base_color_smooth > 0:
+        rendered_base_color = render_pkg_ir.get("base_color_linear", render_pkg["albedo"])
+        loss_base_color_smooth = _masked_edge_aware_loss(rendered_base_color, gt_rgb, reg_mask)
+    else:
+        loss_base_color_smooth = gt_rgb.new_tensor(0.0)
+
+    if lambda_roughness_smooth > 0:
+        rendered_roughness = render_pkg_ir.get("roughness", render_pkg["roughness"])
+        loss_roughness_smooth = _masked_edge_aware_loss(rendered_roughness, gt_rgb, reg_mask)
+    else:
+        loss_roughness_smooth = gt_rgb.new_tensor(0.0)
+
+    if lambda_normal_smooth > 0:
+        rendered_normal = render_pkg_ir.get("rend_normal", render_pkg["normal"])
+        loss_normal_smooth = _masked_edge_aware_loss(rendered_normal, gt_rgb, reg_mask)
+    else:
+        loss_normal_smooth = gt_rgb.new_tensor(0.0)
+
+    if lambda_light_smooth > 0:
+        loss_light_smooth = _compute_env_smooth_loss(gaussians, viewpoint_camera, gt_rgb)
+    else:
+        loss_light_smooth = gt_rgb.new_tensor(0.0)
+
     loss_sops = gt_rgb.new_tensor(0.0)
-    total = loss_pbr + lambda_lam * loss_lam + lambda_sops * loss_sops + lambda_d2n * loss_d2n + lambda_mask * loss_mask
+    total = (
+        loss_pbr
+        + lambda_lam * loss_lam
+        + lambda_sops * loss_sops
+        + lambda_d2n * loss_d2n
+        + lambda_mask * loss_mask
+        + lambda_light * loss_light
+        + lambda_base_color_smooth * loss_base_color_smooth
+        + lambda_roughness_smooth * loss_roughness_smooth
+        + lambda_normal_smooth * loss_normal_smooth
+        + lambda_light_smooth * loss_light_smooth
+    )
 
     stats = {
         "loss_total": total,
@@ -381,6 +469,11 @@ def compute_stage2_sop_loss(
         "loss_sops": loss_sops,
         "loss_d2n": loss_d2n,
         "loss_mask": loss_mask,
+        "loss_light": loss_light,
+        "loss_base_color_smooth": loss_base_color_smooth,
+        "loss_roughness_smooth": loss_roughness_smooth,
+        "loss_normal_smooth": loss_normal_smooth,
+        "loss_light_smooth": loss_light_smooth,
         "pbr_l1": pbr_l1,
         "pbr_ssim": pbr_ssim,
         "shading_points": gt_rgb.new_tensor(float(shading_idx.numel())),

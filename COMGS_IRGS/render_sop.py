@@ -190,8 +190,16 @@ def render_set(model_path, name, iteration, views, gaussians, sop_state, pipelin
         for key in keys:
             os.makedirs(os.path.join(path_prefix, key), exist_ok=True)
         env_dict = gaussians.render_env_map()
-        env_image = rgb_to_srgb(env_dict["env"].permute(2, 0, 1))
-        torchvision.utils.save_image(env_image, os.path.join(path_prefix, "env.png"))
+        if "env1" in env_dict and "env2" in env_dict:
+            env_grid = [
+                rgb_to_srgb(env_dict["env1"].permute(2, 0, 1)),
+                rgb_to_srgb(env_dict["env2"].permute(2, 0, 1)),
+            ]
+            env_grid = torchvision.utils.make_grid(env_grid, nrow=1, padding=10)
+            torchvision.utils.save_image(env_grid, os.path.join(path_prefix, "env.png"))
+        else:
+            env_image = rgb_to_srgb(env_dict["env"].permute(2, 0, 1))
+            torchvision.utils.save_image(env_image, os.path.join(path_prefix, "env.png"))
 
     psnr_avg = 0.0
     ssim_avg = 0.0
@@ -219,7 +227,10 @@ def render_set(model_path, name, iteration, views, gaussians, sop_state, pipelin
             continue
 
         save_mask = _view_output_mask(view, gt_image)
-        torchvision.utils.save_image(gt_image, os.path.join(gts_path, f"{idx:05d}.png"))
+        gt_to_save = gt_image
+        if save_mask is not None:
+            gt_to_save = gt_to_save * save_mask
+        torchvision.utils.save_image(gt_to_save, os.path.join(gts_path, f"{idx:05d}.png"))
         for key in keys:
             out = outputs[key]
             if out.shape[0] == 1:
