@@ -217,7 +217,6 @@ def init_sop_textures_from_irgs_trace(
             ray_origins,
             ray_dirs,
             features=material_features,
-            camera_center=None,
         )
         trace_alpha = torch.clamp(trace_outputs["alpha"][..., None], 0.0, 1.0)
         local_radiance = torch.clamp_min(trace_outputs["color"], 0.0)

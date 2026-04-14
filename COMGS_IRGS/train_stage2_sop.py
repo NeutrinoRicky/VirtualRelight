@@ -31,9 +31,13 @@ class Stage2SOPState(nn.Module):
         probe_normal = torch.nn.functional.normalize(payload["probe_normal"].float().cuda(), dim=-1, eps=1e-6)
         probe_lin_tex = payload["probe_lin_tex"].float().cuda()
         probe_occ_tex = payload["probe_occ_tex"].float().cuda()
+        target_probe_lin_tex = payload.get("target_probe_lin_tex", payload["probe_lin_tex"]).float().cuda()
+        target_probe_occ_tex = payload.get("target_probe_occ_tex", payload["probe_occ_tex"]).float().cuda()
 
         self.register_buffer("probe_xyz", probe_xyz)
         self.register_buffer("probe_normal", probe_normal)
+        self.register_buffer("target_probe_lin_tex", torch.clamp_min(target_probe_lin_tex, 0.0))
+        self.register_buffer("target_probe_occ_tex", torch.clamp(target_probe_occ_tex, 0.0, 1.0))
         self.probe_lin_tex = nn.Parameter(probe_lin_tex.requires_grad_(True))
         self.probe_occ_tex = nn.Parameter(probe_occ_tex.requires_grad_(True))
 
@@ -61,6 +65,8 @@ class Stage2SOPState(nn.Module):
             "probe_normal": self.probe_normal.detach().cpu(),
             "probe_lin_tex": self.lin_tex.detach().cpu(),
             "probe_occ_tex": self.occ_tex.detach().cpu(),
+            "target_probe_lin_tex": self.target_probe_lin_tex.detach().cpu(),
+            "target_probe_occ_tex": self.target_probe_occ_tex.detach().cpu(),
         }
         for key in self._optional_tensor_keys:
             payload[key] = getattr(self, key).detach().cpu()
@@ -108,6 +114,12 @@ def _freeze_sh_gradients(gaussians) -> None:
     print("[Stage2-SOP] Frozen SH gradients for f_dc and f_rest.")
 
 
+def _compute_sop_texture_loss(sop_state: Stage2SOPState):
+    loss_lin = F.l1_loss(sop_state.probe_lin_tex, sop_state.target_probe_lin_tex)
+    loss_occ = F.l1_loss(sop_state.probe_occ_tex, sop_state.target_probe_occ_tex)
+    return loss_lin + loss_occ, loss_lin, loss_occ
+
+
 def _resolve_sop_init_path(path_str: str, model_path: str) -> Path:
     if path_str:
         path = Path(path_str)
@@ -147,8 +159,28 @@ def _load_initial_state(gaussians, opt, args):
         sop_state = Stage2SOPState(payload["sop"])
         return int(payload.get("iteration", 0)), sop_state, payload.get("sop_optimizer"), payload.get("source_info", {})
 
+    if args.start_checkpoint_irgs:
+        irgs_payload = torch.load(args.start_checkpoint_irgs, weights_only=False)
+        if not isinstance(irgs_payload, (tuple, list)) or len(irgs_payload) < 1:
+            raise RuntimeError(f"Unsupported IRGS checkpoint payload: {type(irgs_payload).__name__}")
+
+        model_params = irgs_payload[0]
+        gaussians.restore(model_params, None)
+        gaussians.training_setup(opt)
+
+        sop_path = _resolve_sop_init_path(args.sop_init, args.model_path)
+        sop_state = Stage2SOPState(_load_sop_payload(sop_path))
+        source_info = {
+            "irgs_checkpoint": args.start_checkpoint_irgs,
+            "sop_init": str(sop_path),
+        }
+        return 0, sop_state, None, source_info
+
     if not args.start_checkpoint_refgs:
-        raise RuntimeError("Stage2 SOP requires --start_checkpoint_refgs when --start_checkpoint is not provided.")
+        raise RuntimeError(
+            "Stage2 SOP requires --start_checkpoint_refgs or --start_checkpoint_irgs "
+            "when --start_checkpoint is not provided."
+        )
 
     refgs_payload = torch.load(args.start_checkpoint_refgs, weights_only=False)
     if not isinstance(refgs_payload, (tuple, list)) or len(refgs_payload) < 1:
@@ -306,8 +338,9 @@ def training_stage2_sop(dataset, opt, pipe, args):
     ema_total = 0.0
     ema_pbr = 0.0
     ema_lam = 0.0
-    ema_d2n = 0.0
-    ema_mask = 0.0
+    ema_sops = 0.0
+    ema_sops_lin = 0.0
+    ema_sops_occ = 0.0
     ema_light = 0.0
     ema_base_color_smooth = 0.0
     ema_roughness_smooth = 0.0
@@ -361,7 +394,7 @@ def training_stage2_sop(dataset, opt, pipe, args):
             probe_lin_tex=sop_state.lin_tex,
             probe_occ_tex=sop_state.occ_tex,
             lambda_lam=args.lambda_lam,
-            lambda_sops=args.lambda_sops,
+            lambda_sops=0.0,
             lambda_d2n=args.lambda_d2n,
             lambda_mask=args.lambda_mask,
             use_mask_loss=args.use_mask_loss,
@@ -373,6 +406,12 @@ def training_stage2_sop(dataset, opt, pipe, args):
             randomized_samples=not args.disable_sample_jitter,
             cuda_mem_debug=cuda_mem_debug,
         )
+        loss_sops, loss_sops_indirect, loss_sops_occlusion = _compute_sop_texture_loss(sop_state)
+        total_loss = total_loss + args.lambda_sops * loss_sops
+        loss_stats["loss_total"] = total_loss
+        loss_stats["loss_sops"] = loss_sops
+        loss_stats["loss_sops_indirect"] = loss_sops_indirect
+        loss_stats["loss_sops_occlusion"] = loss_sops_occlusion
         _log_cuda_mem(cuda_mem_debug, "before loss.backward")
         total_loss.backward()
         _log_cuda_mem(cuda_mem_debug, "after loss.backward")
@@ -390,8 +429,9 @@ def training_stage2_sop(dataset, opt, pipe, args):
             ema_total = 0.4 * total_loss.item() + 0.6 * ema_total
             ema_pbr = 0.4 * loss_stats["loss_pbr"].item() + 0.6 * ema_pbr
             ema_lam = 0.4 * loss_stats["loss_lam"].item() + 0.6 * ema_lam
-            ema_d2n = 0.4 * loss_stats["loss_d2n"].item() + 0.6 * ema_d2n
-            ema_mask = 0.4 * loss_stats["loss_mask"].item() + 0.6 * ema_mask
+            ema_sops = 0.4 * loss_stats["loss_sops"].item() + 0.6 * ema_sops
+            ema_sops_lin = 0.4 * loss_stats["loss_sops_indirect"].item() + 0.6 * ema_sops_lin
+            ema_sops_occ = 0.4 * loss_stats["loss_sops_occlusion"].item() + 0.6 * ema_sops_occ
             ema_light = 0.4 * loss_stats["loss_light"].item() + 0.6 * ema_light
             ema_base_color_smooth = 0.4 * loss_stats["loss_base_color_smooth"].item() + 0.6 * ema_base_color_smooth
             ema_roughness_smooth = 0.4 * loss_stats["loss_roughness_smooth"].item() + 0.6 * ema_roughness_smooth
@@ -403,9 +443,11 @@ def training_stage2_sop(dataset, opt, pipe, args):
                     {
                         "total": f"{ema_total:.5f}",
                         "pbr": f"{ema_pbr:.5f}",
+                        "sops": f"{ema_sops:.5f}",
+                        "sops_w": f"{args.lambda_sops * ema_sops:.5f}",
+                        "sop_lin": f"{ema_sops_lin:.5f}",
+                        "sop_occ": f"{ema_sops_occ:.5f}",
                         "lam": f"{ema_lam:.5f}",
-                        "d2n": f"{ema_d2n:.5f}",
-                        "mask": f"{ema_mask:.5f}",
                         "light": f"{ema_light:.5f}",
                         "bc_sm": f"{ema_base_color_smooth:.5f}",
                         "r_sm": f"{ema_roughness_smooth:.5f}",
@@ -457,15 +499,17 @@ def _build_parser():
 
     parser.add_argument("--detect_anomaly", action="store_true", default=False)
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--black_background", action="store_true", default=False)
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
 
     parser.add_argument("--start_checkpoint", type=str, default="")
     parser.add_argument("--start_checkpoint_refgs", type=str, default="")
+    parser.add_argument("--start_checkpoint_irgs", type=str, default="")
     parser.add_argument("--sop_init", type=str, default="")
 
     parser.add_argument("--lambda_lam", type=float, default=0.0)
-    parser.add_argument("--lambda_sops", type=float, default=0.0)
+    parser.add_argument("--lambda_sops", type=float, default=1.0)
     parser.add_argument("--lambda_d2n", type=float, default=0.05)
     parser.add_argument("--lambda_mask", type=float, default=0.05)
     parser.add_argument("--use_mask_loss", action="store_true", default=False)
@@ -484,6 +528,8 @@ def _build_parser():
 def main():
     parser = _build_parser()
     args = get_combined_args(parser)
+    if getattr(args, "black_background", False):
+        args.white_background = False
 
     if not _cli_has_flag("diffuse_sample_num"):
         args.diffuse_sample_num = 128

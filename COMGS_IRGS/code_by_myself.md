@@ -20,16 +20,18 @@ CUDA_VISIBLE_DEVICES=3 python SOP/phase1_initializer_point_cloud.py \
   --checkpoint /mnt/store/fd/project/StaticReconstruction/IRGS/outputs/TensoIR_Synthetic/ficus/refgs/chkpnt50000.pth
 
 CUDA_VISIBLE_DEVICES=3 python SOP/init_sop_query_textures.py \
-  -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/ficus \
-  -m ./outputs/TensoIR_Synthetic/ficus/irgs_sop \
-  --checkpoint /mnt/store/fd/project/StaticReconstruction/IRGS/outputs/TensoIR_Synthetic/ficus/refgs/chkpnt50000.pth \
-  --probe_file ./outputs/TensoIR_Synthetic/ficus/irgs_sop/SOP_phase1/probe_init_data.npz \
-  --output_dir ./outputs/TensoIR_Synthetic/ficus/irgs_sop/SOP_query_init
+  -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/armadillo \
+  -m ./outputs/TensoIR_Synthetic/armadillo/irgs_sop \
+  --checkpoint /mnt/store/fd/project/StaticReconstruction/IRGS/outputs/TensoIR_Synthetic/armadillo/refgs/chkpnt50000.pth \
+  --probe_file ./outputs/TensoIR_Synthetic/armadillo/irgs_sop/SOP_phase1/probe_init_data.npz \
+  --output_dir ./outputs/TensoIR_Synthetic/armadillo/irgs_sop/SOP_query_init
 
 #### armadillo
-CUDA_VISIBLE_DEVICES=1 python train_stage2_sop.py \
+irgs_sop_new_para_with_new_loss_v3: 真正的 Hammersley sampling with random rotation
+irgs_sop_new_para_with_new_loss_v4: 加入真正的loss_sops
+CUDA_VISIBLE_DEVICES=3 python train_stage2_sop.py \
   -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/armadillo \
-  -m ./outputs/TensoIR_Synthetic/armadillo/irgs_sop_new_para_with_new_loss_v2 \
+  -m ./outputs/TensoIR_Synthetic/armadillo/irgs_sop_new_para_with_new_loss_v4 \
   --start_checkpoint_refgs /mnt/store/fd/project/StaticReconstruction/IRGS/outputs/TensoIR_Synthetic/armadillo/refgs/chkpnt50000.pth \
   --sop_init ./outputs/TensoIR_Synthetic/armadillo/irgs_sop/SOP_query_init/sop_query_init.pt \
   --iterations 2000 \
@@ -43,11 +45,13 @@ CUDA_VISIBLE_DEVICES=1 python train_stage2_sop.py \
   --init_roughness_value 0.6 \
   --lambda_light 0.1 \
   --init_metallic_value 0.1 \
-  --envmap_cubemap_lr 0.01
+  --envmap_cubemap_lr 0.01 \
+  --lambda_sops 1 \
+  --black_background
 
 CUDA_VISIBLE_DEVICES=3 python render_sop.py \
   -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/armadillo \
-  -m /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_IRGS/outputs/TensoIR_Synthetic/armadillo/irgs_sop_new_para_with_new_loss_v2 \
+  -m /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_IRGS/outputs/TensoIR_Synthetic/armadillo/irgs_sop_new_para_with_new_loss_v4 \
   --skip_train
 
 #### ficus

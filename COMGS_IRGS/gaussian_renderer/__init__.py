@@ -552,6 +552,52 @@ def sample_incident_rays(normals, is_training=False, sample_num=24):
     return incident_dirs, incident_areas  # [N, S, 3], [N, S, 1]
 
 
+def _radical_inverse_vdc_sop(bits):
+    bits = bits.to(torch.int64)
+    bits = ((bits << 16) | (bits >> 16)) & 0xFFFFFFFF
+    bits = (((bits & 0x55555555) << 1) | ((bits & 0xAAAAAAAA) >> 1)) & 0xFFFFFFFF
+    bits = (((bits & 0x33333333) << 2) | ((bits & 0xCCCCCCCC) >> 2)) & 0xFFFFFFFF
+    bits = (((bits & 0x0F0F0F0F) << 4) | ((bits & 0xF0F0F0F0) >> 4)) & 0xFFFFFFFF
+    bits = (((bits & 0x00FF00FF) << 8) | ((bits & 0xFF00FF00) >> 8)) & 0xFFFFFFFF
+    return bits.to(torch.float32) * 2.3283064365386963e-10
+
+
+def hammersley_incident_rays_sop(normals, is_training=False, sample_num=24):
+    if sample_num <= 0:
+        raise ValueError(f"sample_num must be positive, got {sample_num}")
+
+    pre_shape = normals.shape[:-1]
+    normals_flat = normals.reshape(-1, 3)
+    device = normals.device
+    dtype = normals.dtype
+    num_normals = normals_flat.shape[0]
+
+    idx_int = torch.arange(sample_num, device=device, dtype=torch.int64)
+    idx = idx_int.to(dtype=dtype)
+    z = ((idx + 0.5) / float(sample_num))[None, :].expand(num_normals, sample_num)
+    radius = torch.sqrt((1.0 - z.square()).clamp_min(0.0))
+
+    theta = 2.0 * np.pi * _radical_inverse_vdc_sop(idx_int).to(device=device, dtype=dtype)
+    theta = theta[None, :].expand(num_normals, sample_num)
+    if is_training:
+        theta = theta + torch.rand((num_normals, 1), device=device, dtype=dtype) * (2.0 * np.pi)
+
+    local_dirs = torch.stack(
+        [
+            torch.sin(theta) * radius,
+            torch.cos(theta) * radius,
+            z,
+        ],
+        dim=1,
+    )
+    rotation_matrix = rotation_between_z(normals_flat)
+    incident_dirs = (rotation_matrix @ local_dirs).transpose(-1, -2)
+    incident_dirs = F.normalize(incident_dirs, dim=-1)
+    incident_dirs = incident_dirs.reshape(*pre_shape, sample_num, 3)
+    incident_areas = incident_dirs.new_full((*pre_shape, sample_num, 1), 2.0 * np.pi)
+    return incident_dirs, incident_areas
+
+
 def _sample_incident_transport(normals, pc, pipe, is_training=False):
     B = normals.shape[0]
     if pipe.diffuse_sample_num > 0 and pipe.light_sample_num == 0:
@@ -577,6 +623,34 @@ def _sample_incident_transport(normals, pc, pipe, is_training=False):
     else:
         raise NotImplementedError
     return incident_dirs, incident_areas
+
+
+def _sample_incident_transport_sop(normals, pc, pipe, is_training=False):
+    B = normals.shape[0]
+    if pipe.diffuse_sample_num > 0 and pipe.light_sample_num == 0:
+        incident_dirs, incident_areas = hammersley_incident_rays_sop(normals, is_training, pipe.diffuse_sample_num)
+    elif pipe.diffuse_sample_num > 0 and pipe.light_sample_num > 0:
+        p_diffuse = pipe.diffuse_sample_num / (pipe.diffuse_sample_num + pipe.light_sample_num)
+        p_light = pipe.light_sample_num / (pipe.diffuse_sample_num + pipe.light_sample_num)
+
+        diffuse_directions, diffuse_areas = hammersley_incident_rays_sop(normals, is_training, pipe.diffuse_sample_num)
+        diffuse_pdfs = 1 / diffuse_areas
+
+        light_directions, light_pdfs = pc.get_envmap.sample_light_directions(B, pipe.light_sample_num, is_training)
+
+        diffuse_pdfs_light = 1 / (2 * np.pi)
+        light_pdfs_diffuse = pc.get_envmap.light_pdf(diffuse_directions)
+
+        diffuse_pdfs = diffuse_pdfs * p_diffuse + light_pdfs_diffuse * p_light
+        light_pdfs = diffuse_pdfs_light * p_diffuse + light_pdfs * p_light
+
+        incident_dirs = torch.cat([diffuse_directions, light_directions], dim=1)
+        incident_pdfs = torch.cat([diffuse_pdfs, light_pdfs], dim=1)
+        incident_areas = 1 / incident_pdfs.clamp_min(1e-6)
+    else:
+        raise NotImplementedError
+    return incident_dirs, incident_areas
+
 
 def rendering_equation(base_color, roughness, metallic, normals, position, viewdirs, pc, pipe, training=False, f0=0.04, relight=False, camera_center=None, **kwargs):
     envmap = pc.get_envmap
@@ -666,7 +740,7 @@ def rendering_equation_sop(
 ):
     _log_cuda_mem(cuda_mem_debug, "before rendering_equation_sop_inner")
     envmap = pc.get_envmap
-    incident_dirs, incident_areas = _sample_incident_transport(normals, pc, pipe, sample_training)
+    incident_dirs, incident_areas = _sample_incident_transport_sop(normals, pc, pipe, sample_training)
     global_incident_lights = envmap(incident_dirs, mode='pure_env')
     _log_cuda_mem(cuda_mem_debug, "before query_sops_directional")
     query_indirect, query_occlusion = query_sops_directional(

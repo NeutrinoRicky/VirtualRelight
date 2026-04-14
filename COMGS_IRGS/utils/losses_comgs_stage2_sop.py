@@ -272,6 +272,9 @@ def compute_stage2_sop_loss(
     pbr_diffuse_map = gt_rgb.new_zeros((3, height, width))
     pbr_specular_map = gt_rgb.new_zeros((3, height, width))
     light_direct_values = None
+    loss_sops = gt_rgb.new_tensor(0.0)
+    loss_sops_indirect = gt_rgb.new_tensor(0.0)
+    loss_sops_occlusion = gt_rgb.new_tensor(0.0)
 
     if shading_idx.numel() > 0:
         pts = points.reshape(-1, 3)[shading_idx]
@@ -308,6 +311,7 @@ def compute_stage2_sop_loss(
         diffuse_linear = render_results["diffuse"]
         specular_linear = render_results["specular"]
         light_direct_values = render_results["light_direct"]
+
         pbr_linear = diffuse_linear + specular_linear
         pbr_rgb = rgb_to_srgb(pbr_linear) * alpha + bg_color.view(1, 3) * (1.0 - alpha)
 
@@ -448,7 +452,6 @@ def compute_stage2_sop_loss(
     else:
         loss_light_smooth = gt_rgb.new_tensor(0.0)
 
-    loss_sops = gt_rgb.new_tensor(0.0)
     total = (
         loss_pbr
         + lambda_lam * loss_lam
@@ -474,6 +477,8 @@ def compute_stage2_sop_loss(
         "loss_roughness_smooth": loss_roughness_smooth,
         "loss_normal_smooth": loss_normal_smooth,
         "loss_light_smooth": loss_light_smooth,
+        "loss_sops_indirect": loss_sops_indirect,
+        "loss_sops_occlusion": loss_sops_occlusion,
         "pbr_l1": pbr_l1,
         "pbr_ssim": pbr_ssim,
         "shading_points": gt_rgb.new_tensor(float(shading_idx.numel())),
