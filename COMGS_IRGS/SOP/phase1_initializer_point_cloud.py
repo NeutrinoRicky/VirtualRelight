@@ -317,6 +317,74 @@ def _farthest_point_sampling(points: np.ndarray, k: int, device: torch.device) -
     return selected.cpu().numpy().astype(np.int64)
 
 
+def _farthest_point_sampling_with_min_distance(
+    points: np.ndarray,
+    k: int,
+    device: torch.device,
+    min_distance: float,
+    distance_space: str = "points",
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    if k <= 0:
+        raise RuntimeError("target_num_probes must be positive.")
+    if points.shape[0] < k:
+        raise RuntimeError(
+            f"Need exactly {k} probes, but only {points.shape[0]} candidate points are available "
+            f"in {distance_space}."
+        )
+    if min_distance <= 0.0:
+        indices = _farthest_point_sampling(points, k, device=device)
+        return indices, {
+            "mode": "fps",
+            "distance_space": distance_space,
+            "target_num_probes": int(k),
+            "input_points": int(points.shape[0]),
+            "min_distance": 0.0,
+            "selected": int(indices.shape[0]),
+        }
+
+    pts = torch.from_numpy(points.astype(np.float32)).to(device)
+    center = pts.mean(dim=0, keepdim=True)
+    center_dist = torch.sum((pts - center) ** 2, dim=1)
+    farthest = int(torch.argmax(center_dist).item())
+
+    min_distance_sq = float(min_distance) * float(min_distance)
+    selected = torch.empty((k,), dtype=torch.long, device=device)
+    min_dist = torch.full((pts.shape[0],), float("inf"), device=device)
+    selected_count = 0
+
+    while selected_count < k:
+        if selected_count > 0 and float(min_dist[farthest].item()) < min_distance_sq:
+            break
+
+        selected[selected_count] = farthest
+        centroid = pts[farthest].unsqueeze(0)
+        dist = torch.sum((pts - centroid) ** 2, dim=1)
+        min_dist = torch.minimum(min_dist, dist)
+        farthest = int(torch.argmax(min_dist).item())
+        selected_count += 1
+
+    stats = {
+        "mode": "fps_hard_min_distance",
+        "distance_space": distance_space,
+        "target_num_probes": int(k),
+        "input_points": int(points.shape[0]),
+        "min_distance": float(min_distance),
+        "min_distance_sq": float(min_distance_sq),
+        "selected": int(selected_count),
+    }
+
+    if selected_count < k:
+        max_remaining_distance = math.sqrt(max(float(min_dist[farthest].item()), 0.0))
+        stats["max_remaining_distance"] = float(max_remaining_distance)
+        raise RuntimeError(
+            f"Hard min-distance NMS selected only {selected_count}/{k} probes with "
+            f"min_distance={min_distance:.6f}. Lower --probe_min_distance_factor or "
+            "--probe_min_distance, or provide a cleaner/larger surface cloud."
+        )
+
+    return selected.cpu().numpy().astype(np.int64), stats
+
+
 def _load_checkpoint_into_gaussians(gaussians: GaussianModel, opt, checkpoint_path: str) -> Dict[str, object]:
     payload = torch.load(checkpoint_path, map_location=torch.device("cuda"), weights_only=False)
     if isinstance(payload, dict) and "gaussians" in payload:
@@ -362,6 +430,110 @@ def _orient_normals_by_center(points: np.ndarray, normals: np.ndarray, center: n
     oriented = normals.copy()
     oriented[flip] *= -1.0
     return _normalize_np(oriented.astype(np.float32))
+
+
+@torch.no_grad()
+def _orient_normals_by_view_votes(
+    points: np.ndarray,
+    normals: np.ndarray,
+    views: List[ViewSurface],
+    object_extent: float,
+    args,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    stats: Dict[str, object] = {
+        "mode": "view_vote",
+        "num_points": int(points.shape[0]),
+        "num_views": int(len(views)),
+        "enabled": False,
+    }
+    if points.shape[0] == 0 or len(views) == 0:
+        stats["reason"] = "empty_points_or_views"
+        return normals, stats
+
+    device = torch.device("cuda")
+    pts = torch.from_numpy(points.astype(np.float32)).to(device=device)
+    oriented = torch.from_numpy(_normalize_np(normals.astype(np.float32))).to(device=device)
+    vote_vectors = torch.zeros_like(pts)
+    vote_counts = torch.zeros((pts.shape[0],), dtype=torch.int32, device=device)
+    vote_signed_sum = torch.zeros((pts.shape[0],), dtype=torch.float32, device=device)
+
+    depth_abs_tol = (
+        float(args.depth_tolerance)
+        if args.depth_tolerance > 0.0
+        else float(args.depth_tolerance_factor) * float(object_extent)
+    )
+    depth_rel_tol = float(args.depth_relative_tolerance)
+    chunk_size = max(1, int(args.normal_orientation_chunk_size))
+
+    for view in views:
+        target_depth = view.depth.unsqueeze(0).to(device=device, dtype=torch.float32)
+        target_valid = view.valid.float().unsqueeze(0).to(device=device, dtype=torch.float32)
+        camera_center = view.camera.camera_center.to(device=device, dtype=torch.float32).view(1, 3)
+
+        for start in range(0, pts.shape[0], chunk_size):
+            end = min(start + chunk_size, pts.shape[0])
+            points_chunk = pts[start:end]
+            normals_chunk = oriented[start:end]
+
+            ndc_xy, target_point_depth, in_image = _project_points_to_view(points_chunk, view.camera)
+            grid = ndc_xy.reshape(1, 1, -1, 2)
+            sampled_valid = F.grid_sample(
+                target_valid,
+                grid,
+                mode="nearest",
+                padding_mode="zeros",
+                align_corners=True,
+            ).reshape(-1) > 0.5
+            sampled_depth = F.grid_sample(
+                target_depth,
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            ).reshape(-1)
+
+            depth_tol = depth_abs_tol + depth_rel_tol * torch.abs(target_point_depth).clamp_min(1e-6)
+            visible = in_image & sampled_valid & (torch.abs(sampled_depth - target_point_depth) <= depth_tol)
+            if not torch.any(visible):
+                continue
+
+            visible_f = visible.to(dtype=points_chunk.dtype)
+            to_camera = F.normalize(camera_center - points_chunk, dim=-1, eps=1e-6)
+            vote_vectors[start:end] += to_camera * visible_f[:, None]
+            vote_counts[start:end] += visible.to(dtype=vote_counts.dtype)
+            vote_signed_sum[start:end] += torch.sum(normals_chunk * to_camera, dim=-1) * visible_f
+
+        del target_depth, target_valid
+
+    min_votes = max(1, int(args.normal_orientation_min_views))
+    vote_norm = torch.linalg.norm(vote_vectors, dim=-1)
+    has_votes = (vote_counts >= min_votes) & (vote_norm > 1e-8)
+    alignment = torch.sum(oriented * vote_vectors, dim=-1)
+    flip = has_votes & (alignment < 0.0)
+    oriented = torch.where(flip[:, None], -oriented, oriented)
+
+    vote_counts_np = _to_numpy(vote_counts).astype(np.float32)
+    mean_signed_dot = _to_numpy(vote_signed_sum / vote_counts.float().clamp_min(1.0)).astype(np.float32)
+    alignment_np = _to_numpy(alignment / vote_norm.clamp_min(1e-8)).astype(np.float32)
+
+    stats.update(
+        {
+            "enabled": True,
+            "reason": "ok",
+            "depth_abs_tolerance": float(depth_abs_tol),
+            "depth_relative_tolerance": float(depth_rel_tol),
+            "min_votes": int(min_votes),
+            "chunk_size": int(chunk_size),
+            "points_with_votes": int(torch.sum(vote_counts > 0).item()),
+            "points_meeting_min_votes": int(torch.sum(has_votes).item()),
+            "points_without_votes": int(torch.sum(vote_counts == 0).item()),
+            "flipped_points": int(torch.sum(flip).item()),
+            "vote_count": _summarize_array(vote_counts_np),
+            "mean_signed_dot_before_flip": _summarize_array(mean_signed_dot[vote_counts_np > 0]),
+            "vote_alignment_before_flip": _summarize_array(alignment_np[vote_counts_np >= float(min_votes)]),
+        }
+    )
+    return _normalize_np(_to_numpy(oriented).astype(np.float32)), stats
 
 
 @torch.no_grad()
@@ -775,20 +947,58 @@ def initialize_sop_phase1_point_cloud(args):
         object_extent=object_extent,
         args=args,
     )
-    if not args.disable_outward_normal_hint:
+    normal_orientation_stats: Dict[str, object] = {
+        "mode": "none",
+        "enabled": False,
+        "reason": "disabled",
+    }
+    normal_orientation_mode = "none" if args.disable_outward_normal_hint else args.normal_orientation_mode
+    if normal_orientation_mode == "center":
         clean_normals = _orient_normals_by_center(clean_points, clean_normals, object_center)
+        normal_orientation_stats = {
+            "mode": "center",
+            "enabled": True,
+            "reason": "legacy_object_center_hint",
+        }
+    elif normal_orientation_mode == "view_vote":
+        clean_normals, normal_orientation_stats = _orient_normals_by_view_votes(
+            points=clean_points,
+            normals=clean_normals,
+            views=view_surfaces,
+            object_extent=object_extent,
+            args=args,
+        )
+    elif normal_orientation_mode != "none":
+        raise ValueError(f"Unknown normal_orientation_mode: {normal_orientation_mode}")
 
-    target_num_probes = min(int(args.target_num_probes), int(clean_points.shape[0]))
+    target_num_probes = int(args.target_num_probes)
     if target_num_probes <= 0:
         raise RuntimeError("target_num_probes must be positive.")
-    probe_surface_indices = _farthest_point_sampling(clean_points, target_num_probes, device=torch.device("cuda"))
-    probe_surface_points = clean_points[probe_surface_indices]
-    probe_normals = _normalize_np(clean_normals[probe_surface_indices])
-
+    if clean_points.shape[0] < target_num_probes:
+        raise RuntimeError(
+            f"Need exactly {target_num_probes} probes, but only {clean_points.shape[0]} clean surface points are available."
+        )
     offset_distance = float(args.offset_distance) if args.offset_distance > 0.0 else float(args.offset_scale) * object_extent
     if offset_distance <= 0.0:
         raise RuntimeError("Computed offset_distance <= 0. Check extent_mode/offset_scale.")
-    probe_points = probe_surface_points + probe_normals * offset_distance
+
+    clean_probe_normals = _normalize_np(clean_normals.astype(np.float32))
+    candidate_probe_points = clean_points + clean_probe_normals * offset_distance
+    probe_min_distance = (
+        float(args.probe_min_distance)
+        if args.probe_min_distance > 0.0
+        else float(args.probe_min_distance_factor) * object_extent
+    )
+    probe_surface_indices, probe_selection_stats = _farthest_point_sampling_with_min_distance(
+        candidate_probe_points,
+        target_num_probes,
+        device=torch.device("cuda"),
+        min_distance=probe_min_distance,
+        distance_space="final_probe_points",
+    )
+    probe_surface_points = clean_points[probe_surface_indices]
+    probe_normals = clean_probe_normals[probe_surface_indices]
+    probe_points = candidate_probe_points[probe_surface_indices]
 
     surface_colors = np.tile(np.array([[0.65, 0.65, 0.65]], dtype=np.float32), (clean_points.shape[0], 1))
     probe_surface_colors = np.tile(np.array([[0.95, 0.62, 0.22]], dtype=np.float32), (probe_surface_points.shape[0], 1))
@@ -839,6 +1049,7 @@ def initialize_sop_phase1_point_cloud(args):
         "consistent_points": int(consistent_points.shape[0]),
         "num_surface_points": int(clean_points.shape[0]),
         "num_probes": int(probe_points.shape[0]),
+        "probe_selection": probe_selection_stats,
         "offset_scale": float(args.offset_scale),
         "offset_distance": float(offset_distance),
         "filtering": {
@@ -850,6 +1061,7 @@ def initialize_sop_phase1_point_cloud(args):
         },
         "cross_view_consistency": consistency_stats,
         "cleaning": clean_stats,
+        "normal_orientation": normal_orientation_stats,
         "debug_clouds": {
             "candidate": candidate_debug,
             "consistent": consistent_debug,
@@ -863,7 +1075,13 @@ def initialize_sop_phase1_point_cloud(args):
     print(f"[SOP-Phase1-PC] Consistent points: {consistent_points.shape[0]}")
     print(f"[SOP-Phase1-PC] Clean surface points: {clean_points.shape[0]}")
     print(f"[SOP-Phase1-PC] Probes: {probe_points.shape[0]}")
+    print(f"[SOP-Phase1-PC] Probe min distance: {probe_min_distance:.6f}")
     print(f"[SOP-Phase1-PC] Offset distance: {offset_distance:.6f}")
+    print(
+        "[SOP-Phase1-PC] Normal orientation: "
+        f"mode={normal_orientation_stats.get('mode', 'unknown')}, "
+        f"flipped={normal_orientation_stats.get('flipped_points', 0)}"
+    )
     print(f"[SOP-Phase1-PC] Output root: {output_root}")
     return summary
 
@@ -911,8 +1129,18 @@ def _build_parser():
 
     parser.add_argument("--extent_mode", choices=["bbox_diagonal", "max_side"], default="bbox_diagonal")
     parser.add_argument("--target_num_probes", default=5000, type=int)
+    parser.add_argument("--probe_min_distance_factor", default=0.0, type=float)
+    parser.add_argument("--probe_min_distance", default=0.0, type=float)
     parser.add_argument("--offset_scale", "--offset_factor", dest="offset_scale", default=0.005, type=float)
     parser.add_argument("--offset_distance", default=0.0, type=float)
+    parser.add_argument(
+        "--normal_orientation_mode",
+        choices=["view_vote", "center", "none"],
+        default="view_vote",
+        help="Orient fused surface normals before probe offset. view_vote keeps normals on the side visible to cameras.",
+    )
+    parser.add_argument("--normal_orientation_min_views", default=1, type=int)
+    parser.add_argument("--normal_orientation_chunk_size", default=65536, type=int)
     parser.add_argument("--disable_outward_normal_hint", action="store_true")
 
     parser.add_argument("--max_probe_normals_vis", default=400, type=int)

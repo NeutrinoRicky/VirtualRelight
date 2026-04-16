@@ -11,6 +11,10 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
+try:
+    from tqdm import tqdm  # type: ignore
+except ImportError:
+    tqdm = None
 
 
 Array = np.ndarray
@@ -152,6 +156,20 @@ def summarize(values: Iterable[Optional[float]]) -> Dict[str, Optional[float]]:
     }
 
 
+def iter_with_text_progress(
+    tasks: List[Tuple["Comparison", str]],
+    desc: str = "Progress",
+) -> Iterable[Tuple["Comparison", str]]:
+    total = len(tasks)
+    if total == 0:
+        return
+    for idx, item in enumerate(tasks, start=1):
+        pct = 100.0 * idx / total
+        print(f"\r{desc}: {idx}/{total} ({pct:6.2f}%)", end="", flush=True)
+        yield item
+    print("")
+
+
 @dataclass(frozen=True)
 class Comparison:
     name: str
@@ -277,6 +295,7 @@ def run_analysis(
     out_dir: Path,
     alpha_threshold: float,
     limit: int,
+    show_progress: bool,
 ) -> Dict[str, object]:
     irgs_root = find_ours_dir(irgs_test)
     sop_root = find_ours_dir(sop_test)
@@ -284,6 +303,7 @@ def run_analysis(
 
     rows: List[Dict[str, object]] = []
     skipped: Dict[str, str] = {}
+    tasks: List[Tuple[Comparison, str]] = []
 
     for cmp in COMPARISONS:
         sop_names = list_png_names(sop_root / cmp.sop_dir)
@@ -295,8 +315,16 @@ def run_analysis(
             skipped[cmp.name] = f"missing or empty dirs: SOP/{cmp.sop_dir}, IRGS/{cmp.irgs_dir}"
             continue
 
-        for name in common:
-            rows.append(compare_one(cmp, sop_root, irgs_root, name, alpha_threshold))
+        tasks.extend((cmp, name) for name in common)
+
+    iterator: Iterable[Tuple[Comparison, str]] = tasks
+    if show_progress and tasks:
+        if tqdm is not None:
+            iterator = tqdm(tasks, desc="Comparing SOP vs IRGS", unit="pair")
+        else:
+            iterator = iter_with_text_progress(tasks, desc="Comparing SOP vs IRGS")
+    for cmp, name in iterator:
+        rows.append(compare_one(cmp, sop_root, irgs_root, name, alpha_threshold))
 
     csv_path = out_dir / "per_image_metrics.csv"
     fieldnames = [
@@ -396,6 +424,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out_dir", type=Path, default=None, help="Output folder for summary.json and per_image_metrics.csv")
     parser.add_argument("--alpha_threshold", type=float, default=0.5, help="Foreground mask threshold using SOP weight and IRGS rend_alpha")
     parser.add_argument("--limit", type=int, default=-1, help="Only compare the first N images per comparison")
+    parser.add_argument("--no_progress", action="store_true", help="Disable tqdm progress bar")
     return parser.parse_args()
 
 
@@ -412,9 +441,17 @@ def main() -> None:
         out_dir=out_dir.resolve(),
         alpha_threshold=float(args.alpha_threshold),
         limit=int(args.limit),
+        show_progress=not bool(args.no_progress),
     )
     print_summary(result)
 
 
 if __name__ == "__main__":
     main()
+
+'''
+CUDA_VISIBLE_DEVICES=1 python compare_sop_irgs_outputs.py \
+    --alpha_threshold 0.5 \
+    /mnt/store/fd/project/StaticReconstruction/COMGS_Only_metallic/VirtualRelight/COMGS_IRGS/outputs/TensoIR_Synthetic/hotdog/irgs/test \
+    /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_IRGS/outputs/TensoIR_Synthetic/hotdog/irgs_sop_new_para_with_new_loss_v4/test_sop
+'''
