@@ -164,6 +164,12 @@ CUDA_VISIBLE_DEVICES=0 python render_sop.py \
   -m /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_IRGS/outputs/TensoIR_Synthetic/hotdog/irgs_sop_new_init_v5 \
   --skip_train
 
+CUDA_VISIBLE_DEVICES=3 python render_sop_profile.py \
+  -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/hotdog \
+  -m /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_IRGS/outputs/TensoIR_Synthetic/hotdog/irgs_sop_new_init_v5 \
+  --skip_train
+
+
 
 gt pbr_render albedo roughness
 metallic weight depth normal
@@ -215,3 +221,9 @@ average PSNR 35.69 SSIM 0.969 LPIPS 0.042
 
 这个版本的roughness还是不太对 难道说Hammersley采样对于Roughness的优化有这么大的影响?
 CUDA_VISIBLE_DEVICES=2 python train.py -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/armadillo --eval -m ./outputs/TensoIR_Synthetic/armadillo/irgs_latlong_env_new_para --iterations 20000 --start_checkpoint_refgs /mnt/store/fd/project/StaticReconstruction/IRGS/outputs/TensoIR_Synthetic/armadillo/refgs/chkpnt50000.pth --envmap_resolution 128 --lambda_base_color_smooth 2 --lambda_roughness_smooth 2 --diffuse_sample_num 256 --envmap_cubemap_lr 0.01 --lambda_light_smooth 0.0005 --init_roughness_value 0.6 --lambda_light 0.1 --train_ray --init_metallic_value 0.1 --envmap_representation latlong
+
+
+TODO:
+1. 观察render效率不佳的问题
+2. 用体素来实现常数级别的查询时间
+3. DDGI参考把sop变成查询间接光照时只和法线有关系即可
