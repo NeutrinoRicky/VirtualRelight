@@ -35,6 +35,8 @@ _ORIG_QUERY_KNN_PROBES = None
 _PROFILE_PROBE_ATLAS_BUFFER = "_profile_probe_atlas"
 _PROFILE_ENV_ATLAS_ATTR = "_profile_env_atlas"
 _PROFILE_PROBE_FLAT_META = {}
+_PROFILE_PROBE_ATLAS_NCHW_CACHE = None  # cached (N, 4, H, W) probe atlas
+_PROFILE_PROBE_ATLAS_FLAT_HWC_CACHE = None  # cached (N*H*W, C) flat atlas for manual bilinear
 _PROFILE_USE_ENV_ATLAS = False
 _SOP_NEIGHBOR_BACKEND = "knn"
 _SOP_HASH_STATE = None
@@ -43,6 +45,15 @@ _SOP_HASH_STATIC_EXPORTED_ROOTS = set()
 _SOP_HASH_SAVE_STATIC_ONCE = False
 _SOP_HASH_SAVE_HITS_PER_FRAME = False
 _SOP_HASH_MAX_ROW_CANDIDATES = 4096
+
+# ── FRNN backend state ───────────────────────────────────────────────
+_SOP_FRNN_GRID = None          # cached FRNN grid (reusable when probes unchanged)
+_SOP_FRNN_RADIUS = 0.0         # fixed search radius
+_SOP_FRNN_PROBE_XYZ_BATCHED = None  # (1, P, 3) contiguous float32 on CUDA
+try:
+    import frnn as _frnn_module
+except ImportError:
+    _frnn_module = None
 
 
 def _cuda_sync():
@@ -415,6 +426,58 @@ def _lookup_nonempty_neighbor_cells(
     point_ids = point_ids[flat_valid][matched]
     cell_ids = search_pos[matched]
     return point_ids, cell_ids
+
+
+def _query_frnn_neighbors(
+    x_chunk: torch.Tensor,
+    probe_xyz: torch.Tensor,
+    neighbor_k: int,
+) -> tuple:
+    """Fixed-radius nearest neighbor search via the FRNN CUDA library."""
+    global _SOP_FRNN_GRID
+    if _frnn_module is None:
+        raise RuntimeError("FRNN backend requested but `frnn` is not installed. "
+                           "Install from submodules/FRNN.")
+
+    num_points = int(x_chunk.shape[0])
+    device = x_chunk.device
+    dtype = x_chunk.dtype
+
+    knn_dist = torch.full((num_points, neighbor_k), float("inf"), device=device, dtype=dtype)
+    knn_idx = torch.zeros((num_points, neighbor_k), device=device, dtype=torch.long)
+    row_valid = torch.zeros((num_points,), device=device, dtype=torch.bool)
+
+    if num_points == 0 or _SOP_FRNN_PROBE_XYZ_BATCHED is None:
+        return knn_dist, knn_idx, row_valid
+
+    # FRNN expects (N, P, 3) float32 on CUDA
+    query_pts = x_chunk.unsqueeze(0).to(dtype=torch.float32).contiguous()
+    ref_pts = _SOP_FRNN_PROBE_XYZ_BATCHED  # already (1, P2, 3) float32
+
+    dists2, idxs, _nn, grid_out = _frnn_module.frnn_grid_points(
+        query_pts, ref_pts,
+        lengths1=None, lengths2=None,
+        K=neighbor_k,
+        r=_SOP_FRNN_RADIUS,
+        grid=_SOP_FRNN_GRID,
+        return_nn=False,
+        return_sorted=True,
+    )
+    _SOP_FRNN_GRID = grid_out  # cache for subsequent chunks
+
+    idxs_0 = idxs[0]        # (P1, K)
+    dists2_0 = dists2[0]    # (P1, K)
+    valid_mask = idxs_0 >= 0
+    # replace invalid entries
+    idxs_0 = idxs_0.clamp_min(0).to(torch.long)
+    dists2_0 = dists2_0.to(dtype)
+    dists2_0[~valid_mask] = float("inf")
+
+    knn_dist = torch.sqrt(dists2_0.clamp_min(0.0))
+    knn_idx = idxs_0
+    row_valid = valid_mask.any(dim=1)
+
+    return knn_dist, knn_idx, row_valid
 
 
 def _query_sparse_hash_neighbors(
@@ -813,22 +876,54 @@ def _sample_probe_atlas_bilinear_flat(
     with _profile_cuda_block("atlas_sample_index_ms"):
         num_points, neighbor_k = probe_ids.shape
         num_samples = uv.shape[1]
-        flat_probe_ids = probe_ids.reshape(-1)
-        grid = uv[:, None, :, :].expand(-1, neighbor_k, -1, -1)
-        grid = grid.reshape(num_points * neighbor_k, num_samples, 1, 2)
-        grid = grid.to(dtype=probe_atlas_nchw.dtype).mul(2.0).sub(1.0)
+        num_probes, C, H, W = probe_atlas_nchw.shape
+
+        # Pre-compute bilinear indices & weights from uv (shared across all neighbors)
+        idx00, idx10, idx01, idx11, w00, w10, w01, w11 = _bilinear_texel_indices(
+            uv, H, W, wrap_u=False,
+        )
+
+        # Compute per-probe texel base offset: probe_id * (H*W)
+        hw = H * W
+        probe_texel_base = probe_ids * hw  # (P, K)
 
     with _profile_cuda_block("atlas_sample_gather_ms"):
-        sampled_tex = probe_atlas_nchw.index_select(0, flat_probe_ids)
-        sampled = F.grid_sample(
-            sampled_tex,
-            grid,
-            mode="bilinear",
-            padding_mode="border",
-            align_corners=False,
-        )
-        sampled = sampled.squeeze(-1).permute(0, 2, 1).contiguous()
-    return sampled.view(num_points, neighbor_k, num_samples, probe_atlas_nchw.shape[1])
+        # Use cached flat atlas (N*H*W, C) to avoid per-call permute+reshape
+        global _PROFILE_PROBE_ATLAS_FLAT_HWC_CACHE
+        if (
+            _PROFILE_PROBE_ATLAS_FLAT_HWC_CACHE is None
+            or _PROFILE_PROBE_ATLAS_FLAT_HWC_CACHE.shape[0] != num_probes * hw
+        ):
+            _PROFILE_PROBE_ATLAS_FLAT_HWC_CACHE = (
+                probe_atlas_nchw.permute(0, 2, 3, 1).reshape(-1, C).contiguous()
+            )
+        atlas_flat = _PROFILE_PROBE_ATLAS_FLAT_HWC_CACHE
+
+        # Gather: for each (point, neighbor, sample), compute linear index = base + texel_offset
+        linear_00 = probe_texel_base[:, :, None] + idx00[:, None, :]  # (P, K, S)
+        linear_10 = probe_texel_base[:, :, None] + idx10[:, None, :]
+        linear_01 = probe_texel_base[:, :, None] + idx01[:, None, :]
+        linear_11 = probe_texel_base[:, :, None] + idx11[:, None, :]
+
+        # Flatten and gather all 4 corners at once
+        flat_size = num_points * neighbor_k * num_samples
+        all_indices = torch.stack([linear_00, linear_10, linear_01, linear_11], dim=0)  # (4, P, K, S)
+        all_gathered = atlas_flat[all_indices.reshape(4, -1).reshape(-1)]  # (4*flat_size, C)
+        all_gathered = all_gathered.view(4, num_points, neighbor_k, num_samples, C)
+
+        # Bilinear weights: (P, S) -> (P, 1, S, 1) for broadcasting
+        dtype_out = probe_atlas_nchw.dtype
+        w00_b = w00[:, None, :, None].to(dtype=dtype_out)
+        w10_b = w10[:, None, :, None].to(dtype=dtype_out)
+        w01_b = w01[:, None, :, None].to(dtype=dtype_out)
+        w11_b = w11[:, None, :, None].to(dtype=dtype_out)
+
+        sampled = (all_gathered[0] * w00_b
+                 + all_gathered[1] * w10_b
+                 + all_gathered[2] * w01_b
+                 + all_gathered[3] * w11_b)
+
+    return sampled  # (P, K, S, C)
 
 
 def _sample_texture2d_bilinear(texture: torch.Tensor, uv: torch.Tensor, wrap_u: bool = False) -> torch.Tensor:
@@ -936,9 +1031,20 @@ def _query_sops_directional_atlas(
         probe_atlas_flat, atlas_meta = _get_probe_atlas_flat(probe_lin_tex, probe_occ_tex)
         probe_atlas_flat = probe_atlas_flat.to(device=device, dtype=dtype)
         _num_probe_tex, probe_tex_h, probe_tex_w = atlas_meta
-        probe_atlas_nchw = (
-            probe_atlas_flat.view(_num_probe_tex, probe_tex_h, probe_tex_w, 4).permute(0, 3, 1, 2).contiguous()
-        )
+        # Use cached NCHW atlas to avoid repeated reshape/permute
+        global _PROFILE_PROBE_ATLAS_NCHW_CACHE, _PROFILE_PROBE_ATLAS_FLAT_HWC_CACHE
+        if (
+            _PROFILE_PROBE_ATLAS_NCHW_CACHE is None
+            or _PROFILE_PROBE_ATLAS_NCHW_CACHE.data_ptr() != probe_atlas_flat.data_ptr()
+            or _PROFILE_PROBE_ATLAS_NCHW_CACHE.shape[0] != _num_probe_tex
+        ):
+            _PROFILE_PROBE_ATLAS_NCHW_CACHE = (
+                probe_atlas_flat.view(_num_probe_tex, probe_tex_h, probe_tex_w, 4)
+                .permute(0, 3, 1, 2)
+                .contiguous()
+            )
+            _PROFILE_PROBE_ATLAS_FLAT_HWC_CACHE = None  # invalidate derived cache
+        probe_atlas_nchw = _PROFILE_PROBE_ATLAS_NCHW_CACHE
         query_dirs = query_dirs.to(device=device, dtype=dtype)
 
         num_points = x_world.shape[0]
@@ -955,12 +1061,20 @@ def _query_sops_directional_atlas(
     neighbor_k = min(max(int(topk), 1), num_probes)
     query_stride = max(1, int(chunk_size))
     use_sparse_hash = _SOP_NEIGHBOR_BACKEND == "sparse_hash" and _SOP_HASH_STATE is not None
+    use_frnn = _SOP_NEIGHBOR_BACKEND == "frnn"
     for start in range(0, num_points, query_stride):
         end = min(start + query_stride, num_points)
         x_chunk = x_world[start:end]
         dirs_chunk = query_dirs[start:end]
 
-        if use_sparse_hash:
+        if use_frnn:
+            with _profile_cuda_block("frnn_neighbor_ms"):
+                knn_dist, knn_idx, row_valid = _query_frnn_neighbors(
+                    x_chunk=x_chunk,
+                    probe_xyz=probe_xyz,
+                    neighbor_k=neighbor_k,
+                )
+        elif use_sparse_hash:
             with _profile_cuda_block("hash_neighbor_ms"):
                 knn_dist, knn_idx, row_valid = _query_sparse_hash_neighbors(
                     x_chunk=x_chunk,
@@ -1002,14 +1116,16 @@ def _query_sops_directional_atlas(
             )
         with _profile_cuda_block("query_sop_fuse_ms"):
             with _profile_cuda_block("query_sop_fuse_reduce_ms"):
-                sampled_lin = sampled[..., :3]
-                sampled_occ = sampled[..., 3:4]
+                sampled_lin = sampled[..., :3]   # (A, K, S, 3)
+                sampled_occ = sampled[..., 3:4]  # (A, K, S, 1)
 
-                weight_sum = weights.sum(dim=1, keepdim=True)
-                valid = weight_sum.squeeze(-1) > eps
-                denom = weight_sum.unsqueeze(-1).clamp_min(eps)
-                lin_vals = torch.sum(weights[:, :, None, None] * sampled_lin, dim=1) / denom
-                occ_vals = torch.sum(weights[:, :, None, None] * sampled_occ, dim=1) / denom
+                weight_sum = weights.sum(dim=1, keepdim=True)  # (A, 1)
+                valid = weight_sum.squeeze(-1) > eps  # (A,)
+                denom = weight_sum.clamp_min(eps)  # (A, 1)
+                # Use einsum to avoid broadcasting large intermediates
+                # weights: (A, K), sampled_lin: (A, K, S, 3)
+                lin_vals = torch.einsum('ak,aksc->asc', weights, sampled_lin) / denom[:, :, None]
+                occ_vals = torch.einsum('ak,aksc->asc', weights, sampled_occ) / denom[:, :, None]
 
             with _profile_cuda_block("query_sop_fuse_write_ms"):
                 if bool(valid.any()):
@@ -1139,6 +1255,7 @@ def _format_profile_line(output_name: str, idx: int, view, timing: dict) -> str:
     q_prep = timing.get("query_sop_prep_ms", 0.0)
     q_knn = timing.get("knn_ms", 0.0)
     q_hash = timing.get("hash_neighbor_ms", 0.0)
+    q_frnn = timing.get("frnn_neighbor_ms", 0.0)
     q_weight = timing.get("query_sop_weight_ms", 0.0)
     q_uv = timing.get("query_sop_uv_ms", 0.0)
     q_sample = timing.get("atlas_sample_ms", 0.0)
@@ -1148,7 +1265,7 @@ def _format_profile_line(output_name: str, idx: int, view, timing: dict) -> str:
     q_fuse_reduce = timing.get("query_sop_fuse_reduce_ms", 0.0)
     q_fuse_write = timing.get("query_sop_fuse_write_ms", 0.0)
     q_post = timing.get("query_sop_post_ms", 0.0)
-    q_accounted = q_prep + q_knn + q_hash + q_weight + q_uv + q_sample + q_fuse + q_post
+    q_accounted = q_prep + q_knn + q_hash + q_frnn + q_weight + q_uv + q_sample + q_fuse + q_post
     q_other = max(q_total - q_accounted, 0.0)
 
     query_env = timing.get("query_env_ms", 0.0)
@@ -1166,7 +1283,7 @@ def _format_profile_line(output_name: str, idx: int, view, timing: dict) -> str:
         f"raster={timing.get('raster_ms', 0.0):8.2f}ms gt={gt_fetch:6.2f}ms output={output_pack:6.2f}ms "
         f"loss={loss_total:8.2f}ms(inc={incident_sample:6.2f},env={query_env:6.2f},lm={light_mix:6.2f},brdf={brdf:6.2f},other={loss_other:6.2f}) "
         f"query_sop={q_total:8.2f}ms "
-        f"[prep={q_prep:6.2f} knn={q_knn:6.2f} hash={q_hash:6.2f} w={q_weight:6.2f} uv={q_uv:6.2f} "
+        f"[prep={q_prep:6.2f} knn={q_knn:6.2f} hash={q_hash:6.2f} frnn={q_frnn:6.2f} w={q_weight:6.2f} uv={q_uv:6.2f} "
         f"sample={q_sample:6.2f}(idx={q_sample_index:6.2f},g={q_sample_gather:6.2f}) "
         f"fuse={q_fuse:6.2f}(r={q_fuse_reduce:6.2f},w={q_fuse_write:6.2f}) "
         f"post={q_post:6.2f} other={q_other:6.2f}]"
@@ -1263,7 +1380,7 @@ def _prepare_sop_neighbor_backend(sop_state: Stage2SOPState, args) -> None:
     global _SOP_HASH_MAX_ROW_CANDIDATES
 
     backend = str(getattr(args, "sop_neighbor_backend", "knn")).strip().lower()
-    if backend not in {"knn", "sparse_hash"}:
+    if backend not in {"knn", "sparse_hash", "frnn"}:
         raise ValueError(f"Unsupported SOP neighbor backend: {backend}")
 
     _SOP_HASH_SAVE_STATIC_ONCE = bool(
@@ -1295,6 +1412,34 @@ def _prepare_sop_neighbor_backend(sop_state: Stage2SOPState, args) -> None:
             print("[SOP-HASH] static non-empty cell export is enabled (once per render set).")
         if _SOP_HASH_MAX_ROW_CANDIDATES > 0:
             print(f"[SOP-HASH] max per-row sparse candidates={_SOP_HASH_MAX_ROW_CANDIDATES} (fallback to KNN if exceeded).")
+    elif backend == "frnn":
+        global _SOP_FRNN_GRID, _SOP_FRNN_RADIUS, _SOP_FRNN_PROBE_XYZ_BATCHED
+        if _frnn_module is None:
+            raise RuntimeError(
+                "FRNN backend requested but `frnn` package is not installed. "
+                "Please install from submodules/FRNN."
+            )
+        frnn_r = float(getattr(args, "sop_frnn_radius", 0.0))
+        if frnn_r <= 0.0:
+            # auto-estimate: use probe spacing as default radius
+            spacing = _estimate_probe_spacing(
+                sop_state.probe_xyz,
+                sample_count=getattr(args, "sop_hash_spacing_samples", 2048),
+                chunk_size=getattr(args, "sop_hash_spacing_chunk", 2048),
+                percentile=getattr(args, "sop_hash_spacing_percentile", 50.0),
+            )
+            frnn_scale = max(1e-4, float(getattr(args, "sop_frnn_radius_scale", 3.0)))
+            frnn_r = spacing * frnn_scale
+        _SOP_FRNN_RADIUS = frnn_r
+        _SOP_FRNN_GRID = None  # will be built on first query and cached
+        _SOP_FRNN_PROBE_XYZ_BATCHED = (
+            sop_state.probe_xyz.detach().unsqueeze(0).to(dtype=torch.float32).contiguous()
+        )
+        print(
+            f"[SOP-FRNN] using FRNN backend: "
+            f"probes={int(sop_state.probe_xyz.shape[0])} "
+            f"radius={_SOP_FRNN_RADIUS:.7f}"
+        )
     else:
         print("[SOP-HASH] using KNN backend for SOP neighbor query.")
         if _SOP_HASH_SAVE_STATIC_ONCE or _SOP_HASH_SAVE_HITS_PER_FRAME:
@@ -1589,8 +1734,8 @@ def _build_parser():
         "--sop_neighbor_backend",
         type=str,
         default="knn",
-        choices=["knn", "sparse_hash"],
-        help="SOP neighbor search backend: exact KNN or surface-adaptive sparse hash.",
+        choices=["knn", "sparse_hash", "frnn"],
+        help="SOP neighbor search backend: exact KNN, surface-adaptive sparse hash, or FRNN fixed-radius.",
     )
     parser.add_argument(
         "--sop_hash_cell_size",
@@ -1634,6 +1779,20 @@ def _build_parser():
         type=int,
         default=4096,
         help="Upper bound of sparse-hash probe candidates per shading row; larger values may be slow.",
+    )
+
+    # ── FRNN backend arguments ────────────────────────────────────────
+    parser.add_argument(
+        "--sop_frnn_radius",
+        type=float,
+        default=0.0,
+        help="Fixed search radius for FRNN backend. <=0 means auto-estimate from probe spacing.",
+    )
+    parser.add_argument(
+        "--sop_frnn_radius_scale",
+        type=float,
+        default=3.0,
+        help="When auto-estimating FRNN radius: radius = spacing_estimate * sop_frnn_radius_scale.",
     )
 
     parser.add_argument("--use_env_atlas", action="store_true", default=False)

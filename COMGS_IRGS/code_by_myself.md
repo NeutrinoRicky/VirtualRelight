@@ -164,15 +164,17 @@ CUDA_VISIBLE_DEVICES=0 python render_sop.py \
   -m /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_IRGS/outputs/TensoIR_Synthetic/hotdog/irgs_sop_new_init_v5 \
   --skip_train
 
-CUDA_VISIBLE_DEVICES=3 python render_sop_profile.py \
+CUDA_VISIBLE_DEVICES=0 python render_sop_profile.py \
   -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/hotdog \
   -m /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_IRGS/outputs/TensoIR_Synthetic/hotdog/irgs_sop_new_init_v5 \
   --skip_train \
-  --sop_neighbor_backend sparse_hash \
-  --sop_hash_save_static_cells_once \
-  --sop_hash_save_hit_cells_per_frame
+  --sop_neighbor_backend knn
 
+frnn:
+[PROFILE] set=test_sop frame=00010 view=rgba total= 2995.69ms frame_other=    6.53ms view_total=  903.78ms metric=   2.11ms lpips=1055.22ms save= 1028.05ms raster=    4.24ms gt=  0.01ms output= 20.98ms loss=  878.27ms(inc= 62.05,env= 33.08,lm=  4.06,brdf= 52.90,other= 18.80) query_sop=  707.39ms [prep=  7.80 knn=  0.00 hash=  0.00 frnn=120.47 w= 55.78 uv= 67.20 sample=341.45(idx=207.80,g=124.85) fuse= 60.92(r= 20.28,w= 36.51) post=  1.52 other= 52.25]
 
+knn:
+[PROFILE] set=test_sop frame=00010 view=rgba total= 3187.07ms frame_other=    6.23ms view_total= 1095.49ms metric=   2.08ms lpips=1053.40ms save= 1029.86ms raster=    4.16ms gt=  0.01ms output= 21.81ms loss= 1069.25ms(inc= 61.54,env= 33.18,lm=  4.07,brdf= 52.80,other= 18.72) query_sop=  898.95ms [prep=  7.87 knn=301.63 hash=  0.00 frnn=  0.00 w= 55.36 uv= 66.83 sample=349.46(idx=216.02,g=124.75) fuse= 60.34(r= 20.22,w= 36.01) post=  1.52 other= 55.96]
 
 gt pbr_render albedo roughness
 metallic weight depth normal
