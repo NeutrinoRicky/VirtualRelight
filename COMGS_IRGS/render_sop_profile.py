@@ -4,6 +4,7 @@ import time
 from argparse import ArgumentParser
 from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -35,11 +36,513 @@ _PROFILE_PROBE_ATLAS_BUFFER = "_profile_probe_atlas"
 _PROFILE_ENV_ATLAS_ATTR = "_profile_env_atlas"
 _PROFILE_PROBE_FLAT_META = {}
 _PROFILE_USE_ENV_ATLAS = False
+_SOP_NEIGHBOR_BACKEND = "knn"
+_SOP_HASH_STATE = None
+_SOP_HASH_DEBUG_PRINTED_DIRS = set()
+_SOP_HASH_STATIC_EXPORTED_ROOTS = set()
+_SOP_HASH_SAVE_STATIC_ONCE = False
+_SOP_HASH_SAVE_HITS_PER_FRAME = False
+_SOP_HASH_MAX_ROW_CANDIDATES = 4096
 
 
 def _cuda_sync():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+@dataclass
+class SparseSOPHashState:
+    cell_size: float
+    origin: torch.Tensor
+    coord_min: torch.Tensor
+    coord_extent: torch.Tensor
+    key_stride_x: int
+    key_stride_y: int
+    unique_keys: torch.Tensor
+    cell_offsets: torch.Tensor
+    sorted_probe_ids: torch.Tensor
+    unique_cell_coords: torch.Tensor
+    query_offsets: torch.Tensor
+    band_offsets: torch.Tensor
+    band_bbox_min: torch.Tensor
+    band_bbox_max: torch.Tensor
+    debug_obj_text: Optional[str] = None
+    frame_hit_mask: Optional[torch.Tensor] = None
+
+
+def _sanitize_filename(name: str) -> str:
+    safe = [ch if (ch.isalnum() or ch in {"-", "_", "."}) else "_" for ch in str(name)]
+    token = "".join(safe).strip("._")
+    return token if token else "view"
+
+
+def _build_neighbor_offsets(radius_cells: int, device: torch.device) -> torch.Tensor:
+    r = max(0, int(radius_cells))
+    axis = torch.arange(-r, r + 1, device=device, dtype=torch.long)
+    gx, gy, gz = torch.meshgrid(axis, axis, axis, indexing="ij")
+    return torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3).contiguous()
+
+
+def _estimate_probe_spacing(
+    probe_xyz: torch.Tensor,
+    sample_count: int,
+    chunk_size: int,
+    percentile: float,
+) -> float:
+    num_probes = int(probe_xyz.shape[0])
+    if num_probes <= 1:
+        return 1.0
+
+    device = probe_xyz.device
+    sample_count = min(num_probes, max(2, int(sample_count)))
+    if sample_count == num_probes:
+        sample_idx = torch.arange(num_probes, device=device, dtype=torch.long)
+    else:
+        sample_idx = torch.randperm(num_probes, device=device)[:sample_count]
+    sample_pts = probe_xyz.index_select(0, sample_idx)
+
+    min_dist = torch.full((sample_count,), float("inf"), device=device, dtype=probe_xyz.dtype)
+    stride = max(1, int(chunk_size))
+    for start in range(0, num_probes, stride):
+        end = min(start + stride, num_probes)
+        chunk_pts = probe_xyz[start:end]
+        dists = torch.cdist(sample_pts, chunk_pts)
+
+        chunk_ids = torch.arange(start, end, device=device, dtype=torch.long)
+        same_mask = sample_idx[:, None] == chunk_ids[None, :]
+        if bool(same_mask.any()):
+            dists = dists.masked_fill(same_mask, float("inf"))
+        min_dist = torch.minimum(min_dist, dists.min(dim=1).values)
+
+    finite = min_dist[torch.isfinite(min_dist)]
+    if finite.numel() == 0:
+        return 1.0
+
+    q = float(np.clip(float(percentile) / 100.0, 0.05, 0.95))
+    return float(torch.quantile(finite, q).item())
+
+
+def _pack_cell_coords(
+    cell_coords: torch.Tensor,
+    coord_min: torch.Tensor,
+    coord_extent: torch.Tensor,
+    key_stride_x: int,
+    key_stride_y: int,
+):
+    rel = cell_coords - coord_min
+    valid = (
+        (rel[..., 0] >= 0)
+        & (rel[..., 0] < coord_extent[0])
+        & (rel[..., 1] >= 0)
+        & (rel[..., 1] < coord_extent[1])
+        & (rel[..., 2] >= 0)
+        & (rel[..., 2] < coord_extent[2])
+    )
+    keys = rel[..., 0] * int(key_stride_x) + rel[..., 1] * int(key_stride_y) + rel[..., 2]
+    keys = torch.where(valid, keys, torch.full_like(keys, -1))
+    return keys.to(torch.long), valid
+
+
+def _build_sparse_hash_debug_obj_text(
+    hash_state: SparseSOPHashState,
+    max_cells: int,
+    cell_coords: Optional[torch.Tensor] = None,
+    title: str = "SOP sparse hash non-empty cell wireframe",
+) -> str:
+    if cell_coords is None:
+        cell_coords = hash_state.unique_cell_coords
+
+    total_cells = int(cell_coords.shape[0])
+    if total_cells == 0:
+        return ""
+
+    if max_cells > 0 and total_cells > max_cells:
+        sample_ids = torch.linspace(
+            0,
+            total_cells - 1,
+            steps=max_cells,
+            device=cell_coords.device,
+            dtype=torch.float32,
+        ).round().to(torch.long)
+        cell_coords = cell_coords.index_select(0, sample_ids)
+
+    corners = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    edges = (
+        (1, 2),
+        (2, 3),
+        (3, 4),
+        (4, 1),
+        (5, 6),
+        (6, 7),
+        (7, 8),
+        (8, 5),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+        (4, 8),
+    )
+
+    mins = hash_state.origin[None, :] + cell_coords.to(hash_state.origin.dtype) * hash_state.cell_size
+    mins_np = mins.detach().cpu().numpy().astype(np.float64)
+
+    lines = [
+        f"# {title}",
+        f"# cells_total={total_cells}",
+        f"# cells_exported={mins_np.shape[0]}",
+        f"# cell_size={hash_state.cell_size:.9f}",
+    ]
+
+    for base_min in mins_np:
+        verts = corners * hash_state.cell_size + base_min[None, :]
+        for vx, vy, vz in verts:
+            lines.append(f"v {vx:.7f} {vy:.7f} {vz:.7f}")
+
+    for cell_i in range(mins_np.shape[0]):
+        vbase = cell_i * 8
+        for ea, eb in edges:
+            lines.append(f"l {vbase + ea} {vbase + eb}")
+
+    return "\n".join(lines) + "\n"
+
+
+def _save_sparse_hash_static_obj_once(output_root: str) -> None:
+    if not _SOP_HASH_SAVE_STATIC_ONCE:
+        return
+    if _SOP_HASH_STATE is None or not _SOP_HASH_STATE.debug_obj_text:
+        return
+    if output_root in _SOP_HASH_STATIC_EXPORTED_ROOTS:
+        return
+
+    debug_dir = os.path.join(output_root, "sop_hash_cells_3d")
+    os.makedirs(debug_dir, exist_ok=True)
+
+    if debug_dir not in _SOP_HASH_DEBUG_PRINTED_DIRS:
+        _SOP_HASH_DEBUG_PRINTED_DIRS.add(debug_dir)
+        print(f"[SOP-HASH] static non-empty cell wireframe OBJ will be written to {debug_dir}")
+
+    out_path = os.path.join(debug_dir, "static_non_empty_cells.obj")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(_SOP_HASH_STATE.debug_obj_text)
+    _SOP_HASH_STATIC_EXPORTED_ROOTS.add(output_root)
+
+
+def _begin_sparse_hash_hit_frame() -> None:
+    if not _SOP_HASH_SAVE_HITS_PER_FRAME:
+        return
+    if _SOP_HASH_STATE is None or _SOP_HASH_STATE.frame_hit_mask is None:
+        return
+    _SOP_HASH_STATE.frame_hit_mask.zero_()
+
+
+def _save_sparse_hash_hit_cells_for_frame(output_root: str, frame_idx: int, view_name: str, args) -> None:
+    if not _SOP_HASH_SAVE_HITS_PER_FRAME:
+        return
+    if _SOP_HASH_STATE is None or _SOP_HASH_STATE.frame_hit_mask is None:
+        return
+
+    hit_cell_ids = torch.nonzero(_SOP_HASH_STATE.frame_hit_mask, as_tuple=False).squeeze(-1)
+    if hit_cell_ids.numel() == 0:
+        return
+
+    hit_cell_coords = _SOP_HASH_STATE.unique_cell_coords.index_select(0, hit_cell_ids)
+    hit_obj_text = _build_sparse_hash_debug_obj_text(
+        _SOP_HASH_STATE,
+        max_cells=int(getattr(args, "sop_hash_hit_debug_max_cells", 3000)),
+        cell_coords=hit_cell_coords,
+        title="SOP sparse hash per-frame shading-hit cells",
+    )
+    if not hit_obj_text:
+        return
+
+    debug_dir = os.path.join(output_root, "sop_hash_hit_cells_3d")
+    os.makedirs(debug_dir, exist_ok=True)
+    if debug_dir not in _SOP_HASH_DEBUG_PRINTED_DIRS:
+        _SOP_HASH_DEBUG_PRINTED_DIRS.add(debug_dir)
+        print(f"[SOP-HASH] per-frame shading-hit cell wireframe OBJ will be written to {debug_dir}")
+
+    safe_view = _sanitize_filename(view_name)
+    out_path = os.path.join(debug_dir, f"{frame_idx:05d}_{safe_view}.obj")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(hit_obj_text)
+
+
+def _build_sparse_surface_hash(probe_xyz: torch.Tensor, args) -> SparseSOPHashState:
+    if probe_xyz.numel() == 0:
+        raise RuntimeError("Cannot build SOP sparse hash without probes.")
+
+    probe_xyz = probe_xyz.detach().contiguous()
+    device = probe_xyz.device
+    dtype = probe_xyz.dtype
+
+    spacing = _estimate_probe_spacing(
+        probe_xyz=probe_xyz,
+        sample_count=getattr(args, "sop_hash_spacing_samples", 2048),
+        chunk_size=getattr(args, "sop_hash_spacing_chunk", 2048),
+        percentile=getattr(args, "sop_hash_spacing_percentile", 50.0),
+    )
+    override_cell_size = float(getattr(args, "sop_hash_cell_size", 0.0))
+    if override_cell_size > 0.0:
+        cell_size = override_cell_size
+    else:
+        cell_scale = max(1e-4, float(getattr(args, "sop_hash_cell_scale", 1.5)))
+        cell_size = max(1e-6, spacing * cell_scale)
+
+    origin = probe_xyz.min(dim=0).values - 0.5 * cell_size
+    cell_coords = torch.floor((probe_xyz - origin[None, :]) / cell_size).to(torch.long)
+
+    coord_min = cell_coords.min(dim=0).values
+    coord_max = cell_coords.max(dim=0).values
+    coord_extent = coord_max - coord_min + 1
+
+    ex = int(coord_extent[0].item())
+    ey = int(coord_extent[1].item())
+    ez = int(coord_extent[2].item())
+    key_stride_y = ez
+    key_stride_x = ey * ez
+    max_key = (ex - 1) * key_stride_x + (ey - 1) * key_stride_y + (ez - 1)
+    if max_key >= (2**63 - 1):
+        raise RuntimeError("SOP sparse hash key range overflow. Try a larger cell size.")
+
+    packed_keys, _ = _pack_cell_coords(
+        cell_coords=cell_coords,
+        coord_min=coord_min,
+        coord_extent=coord_extent,
+        key_stride_x=key_stride_x,
+        key_stride_y=key_stride_y,
+    )
+    sorted_keys, sort_idx = torch.sort(packed_keys)
+    unique_keys, counts = torch.unique_consecutive(sorted_keys, return_counts=True)
+
+    cell_offsets = torch.zeros(unique_keys.shape[0] + 1, device=device, dtype=torch.long)
+    cell_offsets[1:] = torch.cumsum(counts.to(torch.long), dim=0)
+    sorted_probe_ids = sort_idx.to(torch.long)
+
+    sorted_cell_coords = cell_coords.index_select(0, sorted_probe_ids)
+    first_indices = cell_offsets[:-1]
+    unique_cell_coords = sorted_cell_coords.index_select(0, first_indices)
+
+    query_cells = max(0, int(getattr(args, "sop_hash_query_radius_cells", 1)))
+    band_cells = max(query_cells, int(getattr(args, "sop_hash_surface_band_cells", 3)))
+    query_offsets = _build_neighbor_offsets(query_cells, device=device)
+    band_offsets = _build_neighbor_offsets(band_cells, device=device)
+
+    band_world = float(band_cells) * float(cell_size)
+    probe_min = probe_xyz.min(dim=0).values
+    probe_max = probe_xyz.max(dim=0).values
+    band_bbox_min = probe_min - torch.tensor(band_world, device=device, dtype=dtype)
+    band_bbox_max = probe_max + torch.tensor(band_world, device=device, dtype=dtype)
+
+    hash_state = SparseSOPHashState(
+        cell_size=float(cell_size),
+        origin=origin,
+        coord_min=coord_min,
+        coord_extent=coord_extent,
+        key_stride_x=int(key_stride_x),
+        key_stride_y=int(key_stride_y),
+        unique_keys=unique_keys,
+        cell_offsets=cell_offsets,
+        sorted_probe_ids=sorted_probe_ids,
+        unique_cell_coords=unique_cell_coords,
+        query_offsets=query_offsets,
+        band_offsets=band_offsets,
+        band_bbox_min=band_bbox_min,
+        band_bbox_max=band_bbox_max,
+    )
+    hash_state.debug_obj_text = _build_sparse_hash_debug_obj_text(
+        hash_state,
+        max_cells=int(getattr(args, "sop_hash_debug_max_cells", 5000)),
+    )
+
+    print(
+        "[SOP-HASH] built sparse surface hash: "
+        f"probes={int(probe_xyz.shape[0])} "
+        f"non_empty_cells={int(unique_keys.shape[0])} "
+        f"cell_size={hash_state.cell_size:.7f} "
+        f"spacing_est={spacing:.7f} "
+        f"query_cells={query_cells} band_cells={band_cells}"
+    )
+    return hash_state
+
+
+def _lookup_nonempty_neighbor_cells(
+    point_cell_coords: torch.Tensor,
+    offsets: torch.Tensor,
+    hash_state: SparseSOPHashState,
+):
+    num_points = int(point_cell_coords.shape[0])
+    device = point_cell_coords.device
+    empty = torch.empty((0,), device=device, dtype=torch.long)
+    if num_points == 0 or offsets.numel() == 0:
+        return empty, empty
+
+    num_offsets = int(offsets.shape[0])
+    neighbor_coords = point_cell_coords[:, None, :] + offsets[None, :, :]
+    keys, key_valid = _pack_cell_coords(
+        cell_coords=neighbor_coords,
+        coord_min=hash_state.coord_min,
+        coord_extent=hash_state.coord_extent,
+        key_stride_x=hash_state.key_stride_x,
+        key_stride_y=hash_state.key_stride_y,
+    )
+
+    flat_valid = key_valid.reshape(-1)
+    if not bool(flat_valid.any()):
+        return empty, empty
+
+    flat_keys = keys.reshape(-1)[flat_valid]
+    search_pos = torch.searchsorted(hash_state.unique_keys, flat_keys)
+    in_range = search_pos < hash_state.unique_keys.shape[0]
+    matched = torch.zeros_like(in_range, dtype=torch.bool)
+    if bool(in_range.any()):
+        pos_in = search_pos[in_range]
+        matched[in_range] = hash_state.unique_keys.index_select(0, pos_in) == flat_keys[in_range]
+    if not bool(matched.any()):
+        return empty, empty
+
+    point_ids = torch.arange(num_points, device=device, dtype=torch.long).repeat_interleave(num_offsets)
+    point_ids = point_ids[flat_valid][matched]
+    cell_ids = search_pos[matched]
+    return point_ids, cell_ids
+
+
+def _query_sparse_hash_neighbors(
+    x_chunk: torch.Tensor,
+    probe_xyz: torch.Tensor,
+    neighbor_k: int,
+    hash_state: Optional[SparseSOPHashState],
+):
+    num_points = int(x_chunk.shape[0])
+    device = x_chunk.device
+    dtype = x_chunk.dtype
+
+    knn_dist = torch.full((num_points, neighbor_k), float("inf"), device=device, dtype=dtype)
+    knn_idx = torch.zeros((num_points, neighbor_k), device=device, dtype=torch.long)
+    row_valid = torch.zeros((num_points,), device=device, dtype=torch.bool)
+
+    if hash_state is None or num_points == 0 or hash_state.unique_keys.numel() == 0:
+        return knn_dist, knn_idx, row_valid
+
+    bbox_mask = ((x_chunk >= hash_state.band_bbox_min) & (x_chunk <= hash_state.band_bbox_max)).all(dim=1)
+    if not bool(bbox_mask.any()):
+        return knn_dist, knn_idx, row_valid
+
+    candidate_rows = torch.nonzero(bbox_mask, as_tuple=False).squeeze(-1)
+    x_candidates = x_chunk.index_select(0, candidate_rows)
+    point_cell_coords = torch.floor((x_candidates - hash_state.origin[None, :]) / hash_state.cell_size).to(torch.long)
+
+    band_point_ids, _ = _lookup_nonempty_neighbor_cells(
+        point_cell_coords=point_cell_coords,
+        offsets=hash_state.band_offsets,
+        hash_state=hash_state,
+    )
+    if band_point_ids.numel() == 0:
+        return knn_dist, knn_idx, row_valid
+
+    band_mask = torch.zeros((x_candidates.shape[0],), device=device, dtype=torch.bool)
+    band_mask[band_point_ids] = True
+    candidate_rows = candidate_rows[band_mask]
+    if candidate_rows.numel() == 0:
+        return knn_dist, knn_idx, row_valid
+
+    x_candidates = x_chunk.index_select(0, candidate_rows)
+    point_cell_coords = point_cell_coords[band_mask]
+
+    query_point_ids, query_cell_ids = _lookup_nonempty_neighbor_cells(
+        point_cell_coords=point_cell_coords,
+        offsets=hash_state.query_offsets,
+        hash_state=hash_state,
+    )
+    if query_point_ids.numel() == 0:
+        return knn_dist, knn_idx, row_valid
+
+    query_rows = candidate_rows.index_select(0, query_point_ids)
+    starts = hash_state.cell_offsets.index_select(0, query_cell_ids)
+    ends = hash_state.cell_offsets.index_select(0, query_cell_ids + 1)
+    counts = (ends - starts).to(torch.long)
+    nonzero = counts > 0
+    if not bool(nonzero.any()):
+        return knn_dist, knn_idx, row_valid
+
+    query_cell_ids = query_cell_ids[nonzero]
+    if _SOP_HASH_SAVE_HITS_PER_FRAME and hash_state.frame_hit_mask is not None:
+        hash_state.frame_hit_mask[query_cell_ids] = True
+
+    query_rows = query_rows[nonzero]
+    starts = starts[nonzero]
+    counts = counts[nonzero]
+
+    pair_ids = torch.repeat_interleave(torch.arange(counts.shape[0], device=device, dtype=torch.long), counts)
+    if pair_ids.numel() == 0:
+        return knn_dist, knn_idx, row_valid
+
+    seg_starts = torch.cumsum(counts, dim=0) - counts
+    local_ids = torch.arange(pair_ids.shape[0], device=device, dtype=torch.long) - seg_starts.index_select(0, pair_ids)
+
+    gather_offsets = starts.index_select(0, pair_ids) + local_ids
+    flat_probe_ids = hash_state.sorted_probe_ids.index_select(0, gather_offsets)
+    flat_rows = query_rows.index_select(0, pair_ids)
+
+    flat_delta = probe_xyz.index_select(0, flat_probe_ids) - x_chunk.index_select(0, flat_rows)
+    flat_dist = torch.linalg.norm(flat_delta, dim=-1)
+
+    order = torch.argsort(flat_rows)
+    rows_sorted = flat_rows.index_select(0, order)
+    probe_sorted = flat_probe_ids.index_select(0, order)
+    dist_sorted = flat_dist.index_select(0, order)
+
+    row_counts = torch.bincount(rows_sorted, minlength=num_points)
+    if row_counts.numel() == 0 or int(row_counts.max().item()) <= 0:
+        return knn_dist, knn_idx, row_valid
+
+    max_row_candidates = int(row_counts.max().item())
+    if _SOP_HASH_MAX_ROW_CANDIDATES > 0 and max_row_candidates > _SOP_HASH_MAX_ROW_CANDIDATES:
+        fallback_fn = _ORIG_QUERY_KNN_PROBES if _ORIG_QUERY_KNN_PROBES is not None else sop_utils_module._query_knn_probes
+        if candidate_rows.numel() > 0:
+            fallback_dist, fallback_idx = fallback_fn(
+                x_chunk.index_select(0, candidate_rows),
+                probe_xyz,
+                neighbor_k,
+            )
+            knn_dist[candidate_rows] = fallback_dist
+            knn_idx[candidate_rows] = fallback_idx
+            row_valid[candidate_rows] = True
+        return knn_dist, knn_idx, row_valid
+
+    row_offsets = torch.zeros(num_points + 1, device=device, dtype=torch.long)
+    row_offsets[1:] = torch.cumsum(row_counts.to(torch.long), dim=0)
+    start_for_each = row_offsets.index_select(0, rows_sorted)
+    pos_in_row = torch.arange(rows_sorted.shape[0], device=device, dtype=torch.long) - start_for_each
+
+    dense_dist = torch.full(
+        (num_points, max_row_candidates),
+        float("inf"),
+        device=device,
+        dtype=dtype,
+    )
+    dense_idx = torch.zeros((num_points, max_row_candidates), device=device, dtype=torch.long)
+    dense_dist[rows_sorted, pos_in_row] = dist_sorted
+    dense_idx[rows_sorted, pos_in_row] = probe_sorted
+
+    k_eff = min(neighbor_k, max_row_candidates)
+    top_dist, top_slots = torch.topk(dense_dist, k=k_eff, dim=1, largest=False, sorted=True)
+    top_idx = torch.gather(dense_idx, dim=1, index=top_slots)
+    knn_dist[:, :k_eff] = top_dist
+    knn_idx[:, :k_eff] = top_idx
+    row_valid = row_counts > 0
+
+    return knn_dist, knn_idx, row_valid
 
 
 def _begin_frame_profile():
@@ -451,29 +954,50 @@ def _query_sops_directional_atlas(
 
     neighbor_k = min(max(int(topk), 1), num_probes)
     query_stride = max(1, int(chunk_size))
+    use_sparse_hash = _SOP_NEIGHBOR_BACKEND == "sparse_hash" and _SOP_HASH_STATE is not None
     for start in range(0, num_points, query_stride):
         end = min(start + query_stride, num_points)
         x_chunk = x_world[start:end]
         dirs_chunk = query_dirs[start:end]
 
-        knn_dist, knn_idx = sop_utils_module._query_knn_probes(x_chunk, probe_xyz, neighbor_k)
+        if use_sparse_hash:
+            with _profile_cuda_block("hash_neighbor_ms"):
+                knn_dist, knn_idx, row_valid = _query_sparse_hash_neighbors(
+                    x_chunk=x_chunk,
+                    probe_xyz=probe_xyz,
+                    neighbor_k=neighbor_k,
+                    hash_state=_SOP_HASH_STATE,
+                )
+        else:
+            knn_dist, knn_idx = sop_utils_module._query_knn_probes(x_chunk, probe_xyz, neighbor_k)
+            row_valid = torch.ones((end - start,), device=device, dtype=torch.bool)
+
+        if not bool(row_valid.any()):
+            continue
+
+        active_local = torch.nonzero(row_valid, as_tuple=False).squeeze(-1)
+        x_active = x_chunk.index_select(0, active_local)
+        dirs_active = dirs_chunk.index_select(0, active_local)
+        knn_dist_active = knn_dist.index_select(0, active_local)
+        knn_idx_active = knn_idx.index_select(0, active_local)
+
         with _profile_cuda_block("query_sop_weight_ms"):
             weights = sop_utils_module._compute_neighbor_weights(
-                x_chunk=x_chunk,
+                x_chunk=x_active,
                 probe_xyz=probe_xyz,
                 probe_normal=probe_normal,
-                knn_dist=knn_dist,
-                knn_idx=knn_idx,
+                knn_dist=knn_dist_active,
+                knn_idx=knn_idx_active,
                 radius=radius,
                 eps=eps,
             )
 
         with _profile_cuda_block("query_sop_uv_ms"):
-            uv_chunk = sop_utils_module.dir_to_oct_uv(dirs_chunk).clamp(0.0, 1.0)
+            uv_chunk = sop_utils_module.dir_to_oct_uv(dirs_active).clamp(0.0, 1.0)
         with _profile_cuda_block("atlas_sample_ms"):
             sampled = _sample_probe_atlas_bilinear_flat(
                 probe_atlas_nchw=probe_atlas_nchw,
-                probe_ids=knn_idx,
+                probe_ids=knn_idx_active,
                 uv=uv_chunk,
             )
         with _profile_cuda_block("query_sop_fuse_ms"):
@@ -488,15 +1012,11 @@ def _query_sops_directional_atlas(
                 occ_vals = torch.sum(weights[:, :, None, None] * sampled_occ, dim=1) / denom
 
             with _profile_cuda_block("query_sop_fuse_write_ms"):
-                if bool(valid.all()):
-                    lin_out[start:end] = lin_vals
-                    occ_out[start:end] = occ_vals
-                elif bool(valid.any()):
-                    valid_mask = valid[:, None, None]
-                    lin_chunk = lin_out[start:end]
-                    occ_chunk = occ_out[start:end]
-                    lin_out[start:end] = torch.where(valid_mask, lin_vals, lin_chunk)
-                    occ_out[start:end] = torch.where(valid_mask, occ_vals, occ_chunk)
+                if bool(valid.any()):
+                    write_local = torch.nonzero(valid, as_tuple=False).squeeze(-1)
+                    write_ids = (active_local + start).index_select(0, write_local)
+                    lin_out[write_ids] = lin_vals.index_select(0, write_local)
+                    occ_out[write_ids] = occ_vals.index_select(0, write_local)
 
     with _profile_cuda_block("query_sop_post_ms"):
         occ_out = torch.clamp(occ_out, 0.0, 1.0)
@@ -618,6 +1138,7 @@ def _format_profile_line(output_name: str, idx: int, view, timing: dict) -> str:
     q_total = timing.get("query_sop_ms", 0.0)
     q_prep = timing.get("query_sop_prep_ms", 0.0)
     q_knn = timing.get("knn_ms", 0.0)
+    q_hash = timing.get("hash_neighbor_ms", 0.0)
     q_weight = timing.get("query_sop_weight_ms", 0.0)
     q_uv = timing.get("query_sop_uv_ms", 0.0)
     q_sample = timing.get("atlas_sample_ms", 0.0)
@@ -627,7 +1148,7 @@ def _format_profile_line(output_name: str, idx: int, view, timing: dict) -> str:
     q_fuse_reduce = timing.get("query_sop_fuse_reduce_ms", 0.0)
     q_fuse_write = timing.get("query_sop_fuse_write_ms", 0.0)
     q_post = timing.get("query_sop_post_ms", 0.0)
-    q_accounted = q_prep + q_knn + q_weight + q_uv + q_sample + q_fuse + q_post
+    q_accounted = q_prep + q_knn + q_hash + q_weight + q_uv + q_sample + q_fuse + q_post
     q_other = max(q_total - q_accounted, 0.0)
 
     query_env = timing.get("query_env_ms", 0.0)
@@ -645,7 +1166,7 @@ def _format_profile_line(output_name: str, idx: int, view, timing: dict) -> str:
         f"raster={timing.get('raster_ms', 0.0):8.2f}ms gt={gt_fetch:6.2f}ms output={output_pack:6.2f}ms "
         f"loss={loss_total:8.2f}ms(inc={incident_sample:6.2f},env={query_env:6.2f},lm={light_mix:6.2f},brdf={brdf:6.2f},other={loss_other:6.2f}) "
         f"query_sop={q_total:8.2f}ms "
-        f"[prep={q_prep:6.2f} knn={q_knn:6.2f} w={q_weight:6.2f} uv={q_uv:6.2f} "
+        f"[prep={q_prep:6.2f} knn={q_knn:6.2f} hash={q_hash:6.2f} w={q_weight:6.2f} uv={q_uv:6.2f} "
         f"sample={q_sample:6.2f}(idx={q_sample_index:6.2f},g={q_sample_gather:6.2f}) "
         f"fuse={q_fuse:6.2f}(r={q_fuse_reduce:6.2f},w={q_fuse_write:6.2f}) "
         f"post={q_post:6.2f} other={q_other:6.2f}]"
@@ -730,6 +1251,54 @@ def _load_render_state(gaussians: GaussianModel, args):
     }
     fallback_iter = int(args.iteration) if int(args.iteration) > 0 else 0
     return fallback_iter, sop_state, source_info
+
+
+def _prepare_sop_neighbor_backend(sop_state: Stage2SOPState, args) -> None:
+    global _SOP_NEIGHBOR_BACKEND
+    global _SOP_HASH_STATE
+    global _SOP_HASH_DEBUG_PRINTED_DIRS
+    global _SOP_HASH_STATIC_EXPORTED_ROOTS
+    global _SOP_HASH_SAVE_STATIC_ONCE
+    global _SOP_HASH_SAVE_HITS_PER_FRAME
+    global _SOP_HASH_MAX_ROW_CANDIDATES
+
+    backend = str(getattr(args, "sop_neighbor_backend", "knn")).strip().lower()
+    if backend not in {"knn", "sparse_hash"}:
+        raise ValueError(f"Unsupported SOP neighbor backend: {backend}")
+
+    _SOP_HASH_SAVE_STATIC_ONCE = bool(
+        getattr(args, "sop_hash_save_static_cells_once", False)
+        or getattr(args, "sop_hash_save_cells_per_frame", False)
+    )
+    _SOP_HASH_SAVE_HITS_PER_FRAME = bool(getattr(args, "sop_hash_save_hit_cells_per_frame", False))
+    _SOP_HASH_MAX_ROW_CANDIDATES = max(0, int(getattr(args, "sop_hash_max_row_candidates", 4096)))
+
+    _SOP_NEIGHBOR_BACKEND = backend
+    _SOP_HASH_STATE = None
+    _SOP_HASH_DEBUG_PRINTED_DIRS.clear()
+    _SOP_HASH_STATIC_EXPORTED_ROOTS.clear()
+
+    if backend == "sparse_hash":
+        _SOP_HASH_STATE = _build_sparse_surface_hash(sop_state.probe_xyz, args)
+
+        if _SOP_HASH_SAVE_HITS_PER_FRAME:
+            _SOP_HASH_STATE.frame_hit_mask = torch.zeros(
+                (_SOP_HASH_STATE.unique_keys.shape[0],),
+                device=_SOP_HASH_STATE.unique_keys.device,
+                dtype=torch.bool,
+            )
+            print("[SOP-HASH] per-frame shading-hit cell export is enabled.")
+        else:
+            _SOP_HASH_STATE.frame_hit_mask = None
+
+        if _SOP_HASH_SAVE_STATIC_ONCE:
+            print("[SOP-HASH] static non-empty cell export is enabled (once per render set).")
+        if _SOP_HASH_MAX_ROW_CANDIDATES > 0:
+            print(f"[SOP-HASH] max per-row sparse candidates={_SOP_HASH_MAX_ROW_CANDIDATES} (fallback to KNN if exceeded).")
+    else:
+        print("[SOP-HASH] using KNN backend for SOP neighbor query.")
+        if _SOP_HASH_SAVE_STATIC_ONCE or _SOP_HASH_SAVE_HITS_PER_FRAME:
+            print("[SOP-HASH] debug cell export is ignored because backend is knn.")
 
 
 @torch.no_grad()
@@ -844,7 +1413,14 @@ def render_set(model_path, name, iteration, views, gaussians, sop_state, pipelin
     ssim_avg = 0.0
     lpips_avg = 0.0
 
+    if _SOP_NEIGHBOR_BACKEND == "sparse_hash":
+        _save_sparse_hash_static_obj_once(output_root)
+
     for idx, view in enumerate(tqdm(views, desc=f"Rendering progress ({output_name})")):
+        view_name = getattr(view, "image_name", f"{idx:05d}")
+        if _SOP_NEIGHBOR_BACKEND == "sparse_hash":
+            _begin_sparse_hash_hit_frame()
+
         _begin_frame_profile()
         _cuda_sync()
         frame_start = time.perf_counter()
@@ -885,6 +1461,9 @@ def render_set(model_path, name, iteration, views, gaussians, sop_state, pipelin
                         torchvision.utils.save_image(out, os.path.join(path_prefix, key, f"{idx:05d}.png"))
         finally:
             frame_timing = _end_frame_profile()
+
+        if _SOP_NEIGHBOR_BACKEND == "sparse_hash":
+            _save_sparse_hash_hit_cells_for_frame(output_root, idx, view_name, args)
 
         frame_timing["frame_total_ms"] = (time.perf_counter() - frame_start) * 1000.0
         tqdm.write(_format_profile_line(output_name, idx, view, frame_timing))
@@ -937,6 +1516,7 @@ def render_sets(dataset: ModelParams, opt: OptimizationParams, pipeline: Pipelin
 
         _prepare_profile_probe_atlas(sop_state)
         _prepare_profile_env_atlas(gaussians)
+        _prepare_sop_neighbor_backend(sop_state, args)
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -1004,6 +1584,58 @@ def _build_parser():
     parser.add_argument("--sop_query_radius", type=float, default=0.0)
     parser.add_argument("--sop_query_topk", type=int, default=4)
     parser.add_argument("--sop_query_chunk_size", type=int, default=1024)
+
+    parser.add_argument(
+        "--sop_neighbor_backend",
+        type=str,
+        default="knn",
+        choices=["knn", "sparse_hash"],
+        help="SOP neighbor search backend: exact KNN or surface-adaptive sparse hash.",
+    )
+    parser.add_argument(
+        "--sop_hash_cell_size",
+        type=float,
+        default=0.0,
+        help="Override sparse-hash cell size. <=0 uses adaptive spacing statistics.",
+    )
+    parser.add_argument(
+        "--sop_hash_cell_scale",
+        type=float,
+        default=1.5,
+        help="Adaptive cell size = spacing_estimate * sop_hash_cell_scale.",
+    )
+    parser.add_argument("--sop_hash_spacing_samples", type=int, default=2048)
+    parser.add_argument("--sop_hash_spacing_chunk", type=int, default=2048)
+    parser.add_argument("--sop_hash_spacing_percentile", type=float, default=50.0)
+    parser.add_argument("--sop_hash_query_radius_cells", type=int, default=1)
+    parser.add_argument("--sop_hash_surface_band_cells", type=int, default=3)
+    parser.add_argument(
+        "--sop_hash_save_static_cells_once",
+        action="store_true",
+        default=False,
+        help="Export sparse-hash non-empty cells once per render set as 3D wireframe OBJ.",
+    )
+    parser.add_argument(
+        "--sop_hash_save_cells_per_frame",
+        action="store_true",
+        default=False,
+        help="Deprecated alias of --sop_hash_save_static_cells_once.",
+    )
+    parser.add_argument(
+        "--sop_hash_save_hit_cells_per_frame",
+        action="store_true",
+        default=False,
+        help="Export per-frame cells actually touched by shading-point sparse-hash queries.",
+    )
+    parser.add_argument("--sop_hash_debug_max_cells", type=int, default=5000)
+    parser.add_argument("--sop_hash_hit_debug_max_cells", type=int, default=3000)
+    parser.add_argument(
+        "--sop_hash_max_row_candidates",
+        type=int,
+        default=4096,
+        help="Upper bound of sparse-hash probe candidates per shading row; larger values may be slow.",
+    )
+
     parser.add_argument("--use_env_atlas", action="store_true", default=False)
     parser.add_argument("--disable_sample_jitter", action="store_true", default=False)
     return parser

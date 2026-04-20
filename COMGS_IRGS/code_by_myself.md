@@ -167,7 +167,10 @@ CUDA_VISIBLE_DEVICES=0 python render_sop.py \
 CUDA_VISIBLE_DEVICES=3 python render_sop_profile.py \
   -s /mnt/store/fd/project/StaticReconstruction/dataset/TensoIR_Synthetic/hotdog \
   -m /mnt/store/fd/project/StaticReconstruction/VirtualRelight/COMGS_IRGS/outputs/TensoIR_Synthetic/hotdog/irgs_sop_new_init_v5 \
-  --skip_train
+  --skip_train \
+  --sop_neighbor_backend sparse_hash \
+  --sop_hash_save_static_cells_once \
+  --sop_hash_save_hit_cells_per_frame
 
 
 
