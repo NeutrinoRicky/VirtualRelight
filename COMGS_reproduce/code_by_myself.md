@@ -8,6 +8,17 @@ CUDA_VISIBLE_DEVICES=0 python train_stage1_comgs.py \
   --lambda_mask 0.05 \
   --save_gbuffers_every 1000
 
+CUDA_VISIBLE_DEVICES=2 python render.py --iteration 30000 -s /mnt/store/fd/project/StaticReconstruction/dataset/TNT/Ignatius -m ./output/tnt/Ignatius --num_cluster 1 --voxel_size 0.004 --sdf_trunc 0.016 --depth_trunc 3.0
+
+CUDA_VISIBLE_DEVICES=2 python render.py \
+  --iteration 30000 \
+  -s /mnt/store/fd/project/StaticReconstruction/dataset/TNT/Ignatius \
+  -m ./output/tnt/Ignatius \
+  --skip_mesh \
+  --render_path \
+  --depth_ratio 1.0
+
+  
 CUDA_VISIBLE_DEVICES=0 python train_stage1_comgs.py \
   -s /mnt/store/fd/project/StaticReconstruction/dataset/BlendMVS/bull \
   -m ./output/BlendMVS/bull \

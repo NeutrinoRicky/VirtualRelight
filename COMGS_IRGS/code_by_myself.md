@@ -170,6 +170,7 @@ CUDA_VISIBLE_DEVICES=0 python render_sop_profile.py \
   --skip_train \
   --sop_neighbor_backend knn
 
+COMGS_IRGS/render_sop_profile.py
 frnn:
 [PROFILE] set=test_sop frame=00010 view=rgba total= 2995.69ms frame_other=    6.53ms view_total=  903.78ms metric=   2.11ms lpips=1055.22ms save= 1028.05ms raster=    4.24ms gt=  0.01ms output= 20.98ms loss=  878.27ms(inc= 62.05,env= 33.08,lm=  4.06,brdf= 52.90,other= 18.80) query_sop=  707.39ms [prep=  7.80 knn=  0.00 hash=  0.00 frnn=120.47 w= 55.78 uv= 67.20 sample=341.45(idx=207.80,g=124.85) fuse= 60.92(r= 20.28,w= 36.51) post=  1.52 other= 52.25]
 
@@ -232,3 +233,11 @@ TODO:
 1. 观察render效率不佳的问题
 2. 用体素来实现常数级别的查询时间
 3. DDGI参考把sop变成查询间接光照时只和法线有关系即可
+
+CUDA_VISIBLE_DEVICES=0 python render_lego_into_ignatius.py \
+  --output_dir ./outputs/composite/lego_into_ignatius \
+  --max_width 1600 \
+  --post_scale 0.632
+
+CUDA_VISIBLE_DEVICES=0 python initialize_shadow_region_sop.py
+CUDA_VISIBLE_DEVICES=0 python initialize_shadow_region_sop_from_fuse_mesh.py
